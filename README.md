@@ -1,5 +1,7 @@
 # KuchiClaw
 
+[![CI](https://github.com/jonathanavni/kuchiclaw/actions/workflows/ci.yml/badge.svg)](https://github.com/jonathanavni/kuchiclaw/actions/workflows/ci.yml)
+
 A minimal AI agent framework with Docker container isolation, built from scratch in TypeScript.
 
 ("Kuchi" — a nickname meaning "tiny one." This is the tiny claw.)
