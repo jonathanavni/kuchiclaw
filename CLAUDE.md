@@ -33,7 +33,7 @@ Working flow (Telegram): `npx tsx src/index.ts` (secrets loaded from `.env`) →
 - `src/index.ts` — Main orchestrator entrypoint: connects Telegram channel, starts IPC polling + task scheduler, loads MCP config, routes messages through per-group queue via chatIdToGroup, graceful shutdown on SIGINT/SIGTERM
 - `src/group-queue.ts` — Per-group FIFO queue with per-group concurrency cap, exponential backoff retry, auth-failure detection, onComplete/onError callbacks for task logging. Calls `getSecrets()` per job (not at startup) so OAuth tokens stay fresh — access tokens expire after 8h and the process is long-lived
 - `src/group-mapping.ts` — Maps channel chat IDs to group folder names (`chatIdToGroup`, `groupToChatId`). MAIN_CHAT_ID is channel-qualified (e.g., `tg-<your-chat-id>`)
-- `src/ipc.ts` — Filesystem-based IPC: polls `data/ipc/` for JSON requests from containers, validates and executes them (message, task_create/pause/resume/cancel/list), two-tier authorization (main=unrestricted, others=scoped to own chat/tasks), moves failures to `errors/`
+- `src/ipc.ts` / `src/ipc-poll.ts` — Filesystem-based IPC. Each container mounts its own per-group namespace `data/ipc/<group>/`; the host derives request identity from the mount path (the directory a request arrives in), never from the container-written payload. `ipc-poll.ts` polls each group subdir with bounded enumeration + TOCTOU-safe fd reads; `ipc.ts` holds `execute`/handlers/authorization (message, task_create/pause/resume/cancel/list). Destination authorization runs at every consumption point via canonical identity validators (`src/ipc-auth.ts`): tg-only group names, canonical-decimal chat ids. Two-tier authorization (main=unrestricted, others=scoped to own chat/tasks). Failures quarantined to `data/ipc-errors/` (outside any container mount)
 - `src/task-scheduler.ts` — Polls every 60s for due tasks, supports cron (via cron-parser), interval (with drift prevention), and one-shot schedules, enqueues into GroupQueue, in-flight tracking via Set
 - `src/cli.ts` — CLI entrypoint: reads prompt from args/stdin, gets auth token, supports `--group` and `--history` flags, stores messages in SQLite, injects recent history into container
 - `src/auth.ts` — Authentication helpers: resolves auth via OAuth auto-refresh → API key (with Sonnet downgrade) → keychain, returns `AuthResult` with secrets + `isApiKeyFallback` flag, collects skill secrets (FASTMAIL_API_TOKEN) from env (shared by cli.ts and index.ts)
@@ -55,7 +55,7 @@ Working flow (Telegram): `npx tsx src/index.ts` (secrets loaded from `.env`) →
 - `skills/` — Simple skills directory (CLI scripts/API wrappers, mounted read-only into containers). Includes `fastmail.mjs` (email via JMAP as koochi@fastmail.com), `backup.sh` (living file + SQLite backup to private git repo)
 - `groups/example/` — Example living files for reference (tracked in git). Real groups are gitignored — created at runtime by `ensureGroupFolder()`
 - `data/kuchiclaw.db` — SQLite database (auto-created on first run)
-- `data/ipc/` — IPC request directory (containers write here, host polls)
+- `data/ipc/<group>/` — per-group IPC request directories (each container writes only to its own; host polls all). `data/ipc-errors/` (outside the mounted tree) quarantines failed/malformed requests. `data/ipc-layout-v2` — cutover attestation marker (see `deploy/cutover-m12-p1.sh`)
 - `data/oauth.json` — OAuth tokens for auto-refresh (accessToken, refreshToken, expiresAt; chmod 600, gitignored)
 
 **Deployment (M9) + Backup (M11):**

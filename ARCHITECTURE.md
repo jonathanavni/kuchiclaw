@@ -66,9 +66,11 @@ The container image is ~698MB due to the Claude Agent SDK bundle. No browser is 
 
 ### IPC Mechanism
 
-Filesystem-based JSON polling, same as NanoClaw. Containers write JSON request files to a mounted `/workspace/ipc/` directory. The host polls every second, validates each request against authorization rules, executes it, and deletes the file (or moves it to `errors/` on failure).
+Filesystem-based JSON polling, same as NanoClaw. Each container mounts its **own** per-group namespace `data/ipc/<group>/` at `/workspace/ipc/` — a container can only write into its own directory. The host polls every second, and derives a request's identity from the mount path it arrives on (the directory name **is** the group), never from any field the container writes. It validates each request against authorization rules, executes it, and deletes the file (or quarantines it to `data/ipc-errors/`, outside any container mount, on failure).
 
-Two-tier authorization: the main group has unrestricted IPC access (can message any chat, manage any group's tasks). Non-main groups are scoped to their own chat and tasks only.
+**Identity is mount-derived, not payload-derived** — the security-critical property. The old shared-directory design trusted a container-written `group` field; the current design cannot be spoofed because a container has no write access to any other group's namespace. Reads are TOCTOU-safe (`O_NOFOLLOW`/`O_NONBLOCK`, regular-file + single-hardlink checks, bounded size), and canonical identity validators (`src/ipc-auth.ts`) gate every destination.
+
+Two-tier authorization: the main group has unrestricted IPC access (can message any chat, manage any group's tasks). Non-main groups are scoped to their own chat and tasks only, enforced at every consumption point (IPC execute, task persistence, scheduler dequeue, crash recovery, queue ingress).
 
 ### Two-Tier Skills System
 

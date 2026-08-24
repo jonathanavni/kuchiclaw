@@ -34,15 +34,25 @@ legacy_containers() {
 [[ "$APP_ROOT" == /opt/kuchiclaw ]] || fail "unexpected application root"
 command -v docker >/dev/null || fail "docker is required"
 command -v sqlite3 >/dev/null || fail "sqlite3 is required"
+command -v journalctl >/dev/null || fail "journalctl is required"
 
 # The installed service executes TypeScript from APP_ROOT, so verify that exact
 # source tree contains the v2 startup gate before changing any deployment state.
+# Confirm the unit actually runs from APP_ROOT first — otherwise the source we
+# inspect below is not the source that will start.
+unit_workdir=$(systemctl show -p WorkingDirectory --value "$SERVICE_NAME" 2>/dev/null || true)
+[[ "$unit_workdir" == "$APP_ROOT" ]] \
+  || fail "service WorkingDirectory ('$unit_workdir') is not $APP_ROOT; inspected source may not be what runs"
 [[ -f "$APP_ROOT/src/db.ts" ]] || fail "deployed v2 database source is missing"
 grep -Fqx 'export const IPC_LAYOUT_DB_VERSION = 2;' "$APP_ROOT/src/db.ts" \
   || fail "deployed checkout is not M12 Phase 1 v2 code"
 [[ -f "$APP_ROOT/src/index.ts" ]] || fail "deployed v2 entrypoint is missing"
 grep -Fq 'enforceStartupGate(startupOptions);' "$APP_ROOT/src/index.ts" \
   || fail "deployed entrypoint does not enforce the v2 startup gate"
+# Require the hardened fresh-install attestation, so a half-applied Phase 1 (the
+# startup gate present but the legacy-mount race still open) is rejected too.
+grep -Fq '!isAbsent(ipcDir)' "$APP_ROOT/src/index.ts" \
+  || fail "deployed entrypoint predates the fresh-install attestation hardening"
 
 systemctl stop "$SERVICE_NAME"
 
@@ -111,9 +121,28 @@ SQL
   [[ -f "$MARKER_PATH" ]] || fail "filesystem attestation was not created"
 fi
 
+# Capture a boundary so the readiness probe below only reads this restart's logs.
+start_marker=$(date '+%Y-%m-%d %H:%M:%S')
 systemctl start "$SERVICE_NAME"
-sleep 2
-systemctl is-active --quiet "$SERVICE_NAME" || fail "service did not remain active after startup"
+
+# Readiness signal emitted by the running binary itself: the orchestrator logs
+# this line only after the startup gate, IPC polling, and the scheduler are all
+# up. Checking it (not just the marker/epoch this script wrote) proves the new
+# code actually booted through the gate. Poll up to 20s — first boot includes a
+# Telegram connect round-trip.
+ready=0
+for _ in $(seq 1 20); do
+  systemctl is-active --quiet "$SERVICE_NAME" \
+    || fail "service exited during startup; inspect: journalctl -u $SERVICE_NAME"
+  if journalctl -u "$SERVICE_NAME" --since "$start_marker" 2>/dev/null \
+      | grep -Fq "[Orchestrator] KuchiClaw is running"; then
+    ready=1
+    break
+  fi
+  sleep 1
+done
+[[ "$ready" == 1 ]] || fail "service did not report readiness after startup"
+# Secondary confirmation that the attestation the gate passed is intact.
 [[ -f "$MARKER_PATH" && ! -L "$MARKER_PATH" ]] \
   || fail "service readiness check found no valid filesystem attestation"
 [[ -f "$DB_PATH" ]] || fail "service readiness check found no database"
