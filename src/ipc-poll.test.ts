@@ -6,11 +6,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   pollOnce,
   quarantineLooseRootRequests,
-  registerSender,
   startPolling,
   stopPolling,
-} from "./ipc.js";
-import { IPC_POLL_MS, MAX_REQUEST_BYTES } from "./config.js";
+} from "./ipc-poll.js";
+import { registerSender } from "./ipc.js";
+import { IPC_POLL_MS, MAX_REQUEST_BYTES, MAX_REQUESTS_PER_NAMESPACE } from "./config.js";
 
 interface Roots { root: string; ipc: string; errors: string }
 let roots: Roots;
@@ -140,7 +140,7 @@ describe("IPC filesystem containment", () => {
 });
 
 describe("IPC polling bounds", () => {
-  it("caps each namespace independently and uses sorted order", async () => {
+  it("bounds enumeration per namespace and still services the next namespace", async () => {
     const first = namespace("tg-1");
     const second = namespace("tg-2");
     for (let i = 0; i < 100; i += 1) {
@@ -150,11 +150,11 @@ describe("IPC polling bounds", () => {
     const sent: string[] = [];
     registerSender(async (_chatId, text) => { sent.push(text); });
     const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const readdir = vi.spyOn(fs, "readdirSync");
     await pollOnce({ ipcDir: roots.ipc, errorsDir: roots.errors });
-    const expected = Array.from({ length: 100 }, (_, i) => `request-${i}.json`)
-      .sort().slice(0, 64).map((name) => name.match(/\d+/)![0]);
-    expect(sent.slice(0, 64)).toEqual(expected);
+    expect(sent.filter((text) => text !== "other")).toHaveLength(MAX_REQUESTS_PER_NAMESPACE);
     expect(sent).toContain("other");
+    expect(readdir.mock.calls.some(([target]) => target === first)).toBe(false);
     expect(warning).toHaveBeenCalledWith(expect.stringContaining('"tg-1"'));
   });
 

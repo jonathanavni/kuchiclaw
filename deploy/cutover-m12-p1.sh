@@ -35,6 +35,15 @@ legacy_containers() {
 command -v docker >/dev/null || fail "docker is required"
 command -v sqlite3 >/dev/null || fail "sqlite3 is required"
 
+# The installed service executes TypeScript from APP_ROOT, so verify that exact
+# source tree contains the v2 startup gate before changing any deployment state.
+[[ -f "$APP_ROOT/src/db.ts" ]] || fail "deployed v2 database source is missing"
+grep -Fqx 'export const IPC_LAYOUT_DB_VERSION = 2;' "$APP_ROOT/src/db.ts" \
+  || fail "deployed checkout is not M12 Phase 1 v2 code"
+[[ -f "$APP_ROOT/src/index.ts" ]] || fail "deployed v2 entrypoint is missing"
+grep -Fq 'enforceStartupGate(startupOptions);' "$APP_ROOT/src/index.ts" \
+  || fail "deployed entrypoint does not enforce the v2 startup gate"
+
 systemctl stop "$SERVICE_NAME"
 
 container_ids=$(legacy_containers)
@@ -103,7 +112,12 @@ SQL
 fi
 
 systemctl start "$SERVICE_NAME"
-systemctl is-active --quiet "$SERVICE_NAME" || fail "service did not become active"
+sleep 2
+systemctl is-active --quiet "$SERVICE_NAME" || fail "service did not remain active after startup"
+[[ -f "$MARKER_PATH" && ! -L "$MARKER_PATH" ]] \
+  || fail "service readiness check found no valid filesystem attestation"
+[[ -f "$DB_PATH" ]] || fail "service readiness check found no database"
+[[ "$(db_version)" == 2 ]] || fail "service readiness check found the wrong database epoch"
 
 echo "M12 Phase 1 IPC cutover complete."
 echo "Recreate trusted scheduled tasks from the main chat, heartbeat first."

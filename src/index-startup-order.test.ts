@@ -25,8 +25,10 @@ vi.mock("./channels/telegram.js", () => ({
 vi.mock("./group-folder.js", () => ({ ensureGroupFolder: effects.ensureGroupFolder }));
 vi.mock("./group-queue.js", () => ({ enqueue: effects.enqueue, shutdown: vi.fn() }));
 vi.mock("./ipc.js", () => ({
-  quarantineLooseRootRequests: effects.quarantineRoot,
   registerSender: effects.registerSender,
+}));
+vi.mock("./ipc-poll.js", () => ({
+  quarantineLooseRootRequests: effects.quarantineRoot,
   startPolling: effects.startPolling,
   stopPolling: vi.fn(),
 }));

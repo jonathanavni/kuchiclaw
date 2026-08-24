@@ -75,6 +75,17 @@ describe("IPC startup gate", () => {
     expect(initializeEpoch).not.toHaveBeenCalled();
   });
 
+  it("refuses an existing DB with zero tasks and an empty IPC root", () => {
+    fs.mkdirSync(ipcDir);
+    const initializeEpoch = vi.fn();
+    expect(() => enforceStartupGate(options({
+      inspectDb: () => ({ exists: true, userVersion: 1, scheduledTaskCount: 0 }),
+      initializeEpoch,
+    }))).toThrow(/run deploy\/cutover-m12-p1\.sh/);
+    expect(initializeEpoch).not.toHaveBeenCalled();
+    expect(fs.existsSync(markerPath)).toBe(false);
+  });
+
   it("requires the DB factor when the external marker exists", () => {
     fs.writeFileSync(markerPath, "");
     expect(() => enforceStartupGate(options({
@@ -82,7 +93,7 @@ describe("IPC startup gate", () => {
     }))).toThrow(/attestation mismatch/);
   });
 
-  it("initializes both attestations for a genuinely fresh install", () => {
+  it("initializes both attestations when the DB and IPC root are absent", () => {
     const initializeEpoch = vi.fn();
     enforceStartupGate(options({ initializeEpoch }));
     expect(initializeEpoch).toHaveBeenCalledOnce();

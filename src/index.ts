@@ -20,12 +20,12 @@ import {
   type DbAttestation,
 } from "./db.js";
 import { enqueue, shutdown as shutdownQueue } from "./group-queue.js";
+import { registerSender } from "./ipc.js";
 import {
   quarantineLooseRootRequests,
-  registerSender,
   startPolling,
   stopPolling,
-} from "./ipc.js";
+} from "./ipc-poll.js";
 import { startScheduler, stopScheduler } from "./task-scheduler.js";
 import { chatIdToGroup, groupToChatId } from "./group-mapping.js";
 import {
@@ -74,8 +74,7 @@ export function enforceStartupGate(options: StartupGateOptions = {}): void {
       throw new Error(`IPC cutover attestation mismatch; ${CUTOVER_INSTRUCTION}`);
     }
   } else {
-    const freshDb = !dbState.exists || dbState.scheduledTaskCount === 0;
-    if (!freshDb || !isAbsentOrEmptyDirectory(ipcDir)) {
+    if (dbState.exists || !isAbsent(ipcDir)) {
       throw new Error(`IPC cutover attestation missing; ${CUTOVER_INSTRUCTION}`);
     }
     initializeEpoch();
@@ -108,10 +107,10 @@ function hasValidMarker(markerPath: string): boolean {
   }
 }
 
-function isAbsentOrEmptyDirectory(directory: string): boolean {
+function isAbsent(targetPath: string): boolean {
   try {
-    const stat = fs.lstatSync(directory);
-    return stat.isDirectory() && !stat.isSymbolicLink() && fs.readdirSync(directory).length === 0;
+    fs.lstatSync(targetPath);
+    return false;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return true;
     throw err;
