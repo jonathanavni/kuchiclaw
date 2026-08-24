@@ -18,7 +18,10 @@ systemd gave up after repeated crashes (StartLimit hit). Last logs:
 
 ${log_tail}"
 
-curl -sS --max-time 10 \
+# --fail-with-body makes curl exit non-zero on an HTTP error (400/401/etc.), so
+# the caller (systemd OnFailure, or the circuit breaker) can tell a real delivery
+# from a rejected one and retry instead of assuming success.
+curl -sS --fail-with-body --max-time 10 \
   -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
   --data-urlencode "chat_id=${chat_id}" \
   --data-urlencode "text=${text}" \

@@ -3,14 +3,17 @@ Description=KuchiClaw AI Agent
 After=network-online.target docker.service
 Wants=network-online.target
 Requires=docker.service
-# Persistent-crash-loop alerting is now owned by the in-process circuit breaker
-# (src/circuit-breaker.ts): it backs off so a transient loop rides out without
-# tripping StartLimit, and it fires the same alert script on a sustained loop.
-# StartLimit stays as a FAILSAFE — if the breaker itself can't run (so restarts
-# come with no backoff), these limits still trip and OnFailure still alerts,
-# preventing the silent-8-day-crash-loop that motivated them originally.
+# The in-process circuit breaker (src/circuit-breaker.ts) is the PRIMARY control:
+# it backs off crash-loops (so the unit self-heals through a longer transient
+# outage instead of being permanently failed at 5 quick crashes) and fires the
+# alert on a sustained loop. StartLimit here is only a LOOSE FAILSAFE: the
+# breaker's escalating backoff never spaces starts fast enough to reach 20 in
+# 300s, so normal operation never trips it — but a breaker that can't run (fast
+# restarts with no backoff) hits ~60 starts/300s and trips it, so OnFailure still
+# alerts. This avoids the silent-8-day-crash-loop without making the breaker
+# precisely shadow a tight systemd window (which it structurally cannot).
 OnFailure=kuchiclaw-alert@%n.service
-StartLimitBurst=5
+StartLimitBurst=20
 StartLimitIntervalSec=300
 
 [Service]

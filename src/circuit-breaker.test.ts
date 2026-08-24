@@ -31,9 +31,11 @@ describe("planStartup (pure ledger + backoff)", () => {
   });
 });
 
-describe("systemd StartLimit is never tripped", () => {
-  // StartLimitBurst=5 / StartLimitIntervalSec=300 / RestartSec=5. A startup crash
-  // happens right after the in-process sleep; systemd then waits RestartSec.
+describe("backoff spaces the crash-loop", () => {
+  // systemd's StartLimit is now a loose failsafe (burst 20), so the backoff no
+  // longer has to precisely defeat a tight window — but it should still escalate
+  // and keep a sustained loop well under the failsafe. A startup crash happens
+  // right after the in-process sleep; systemd then waits RestartSec.
   const RESTART_SEC = 5;
   const WINDOW = 300;
 
@@ -133,6 +135,14 @@ describe("enforceStartupBackoff", () => {
     expect(failAlert).toHaveBeenCalledTimes(1);
     // lastAlertAt NOT set → the next start is still "cooled" and will retry.
     expect(JSON.parse(fs.readFileSync(cbPath, "utf-8")).lastAlertAt).toBeUndefined();
+  });
+
+  it("still alerts when the wall clock jumped backwards since the last alert", async () => {
+    // lastAlertAt is in the future relative to now (clock stepped back) — must not
+    // suppress the alarm.
+    fs.writeFileSync(cbPath, JSON.stringify({ starts: [T0 - 3, T0 - 2, T0 - 1], lastAlertAt: T0 + sec(600) }));
+    await enforceStartupBackoff({ cbPath, now: () => new Date(T0), sleep: async () => {}, alert: okAlert });
+    expect(okAlert).toHaveBeenCalledTimes(1);
   });
 
   it("resetCircuitBreaker removes the state file", () => {

@@ -10,12 +10,15 @@
 //      tripping (so its OnFailure alert no longer fires), the breaker raises the
 //      alarm itself. StartLimit stays as a failsafe for when the breaker can't run.
 //
-// State is a rolling ledger of recent start timestamps — the SAME thing systemd's
-// StartLimit counts (any start within StartLimitIntervalSec), so the breaker's
-// view can't desync from systemd's across clean restarts and redeploys. The
-// backoff is indexed by how many starts fall inside that window; a startup-phase
-// crash happens right after the sleep, so spacing the sleeps guarantees 6 starts
-// never fit in the window (see the systemd-spacing test).
+// State is a rolling ledger of recent start timestamps; the backoff is indexed by
+// how many starts fall inside a 5-minute window. The breaker is the PRIMARY
+// control and systemd's StartLimit is only a loose failsafe (burst 20), so the
+// backoff does NOT need to precisely shadow systemd's rate-limiter — it just has
+// to escalate enough that a real crash-loop is slowed (and alerted) rather than
+// hammering. That deliberate looseness is why deploy-mid-backoff interleavings
+// and wall-clock jumps are harmless here: the worst case is a slightly mistimed
+// backoff, never a permanently-failed unit (an earlier design that tried to
+// exactly track systemd's tight window could not survive those cases).
 
 import fs from "node:fs";
 import path from "node:path";
@@ -133,7 +136,10 @@ export async function enforceStartupBackoff(opts: {
 
   // Persistent loop: alert, retrying on later crashes until one lands, then cool down.
   if (attempt >= ALERT_ATTEMPT) {
-    const cooled = !state.lastAlertAt || nowMs - state.lastAlertAt > ALERT_COOLDOWN_MS;
+    // `elapsed < 0` means the wall clock jumped backwards since the last alert —
+    // treat that as cooled so a clock step can never suppress the alarm.
+    const elapsed = state.lastAlertAt ? nowMs - state.lastAlertAt : Infinity;
+    const cooled = elapsed > ALERT_COOLDOWN_MS || elapsed < 0;
     if (cooled) {
       console.error(`[Breaker] Persistent crash-loop (${attempt} starts) — alerting operator`);
       if (await alert()) state.lastAlertAt = nowMs;
