@@ -22,6 +22,8 @@ export interface Message {
   processing_status: ProcessingStatus;
   chat_id: string | null;
   sender_name: string | null;
+  /** Times this message has been re-enqueued by crash recovery / the stuck sweep. */
+  recovery_count: number;
 }
 
 let db: Database.Database | null = null;
@@ -130,6 +132,8 @@ function initSchema(database: Database.Database): void {
     `ALTER TABLE messages ADD COLUMN processing_status TEXT NOT NULL DEFAULT 'done'`,
     `ALTER TABLE messages ADD COLUMN chat_id TEXT`,
     `ALTER TABLE messages ADD COLUMN sender_name TEXT`,
+    // M12 P3: cap how many times a message is replayed across restarts/sweeps.
+    `ALTER TABLE messages ADD COLUMN recovery_count INTEGER NOT NULL DEFAULT 0`,
   ];
   for (const sql of migrations) {
     try { database.exec(sql); } catch { /* column already exists */ }
@@ -168,6 +172,32 @@ export function getOrphanedMessages(minAgeSec = 10, maxAgeSec = 3600): Message[]
     ORDER BY timestamp ASC
   `);
   return stmt.all(minAgeSec, maxAgeSec) as Message[];
+}
+
+/**
+ * Find messages stranded in 'processing' while the orchestrator is LIVE — older
+ * than a ceiling well beyond the container timeout, so a legitimately in-flight
+ * job (which finishes within the timeout) is never swept. Uses the creation
+ * timestamp as the stuck proxy (a status-change column would be exact but adds
+ * surface; a backlog older than the ceiling is negligible for a single-operator bot).
+ */
+export function getStuckProcessingMessages(minAgeSec: number): Message[] {
+  const stmt = getDb().prepare(`
+    SELECT * FROM messages
+    WHERE role = 'user'
+      AND processing_status = 'processing'
+      AND timestamp < datetime('now', '-' || ? || ' seconds')
+    ORDER BY timestamp ASC
+  `);
+  return stmt.all(minAgeSec) as Message[];
+}
+
+/** Increment a message's recovery counter and return the new value. */
+export function incrementRecoveryCount(messageId: number): number {
+  const row = getDb()
+    .prepare("UPDATE messages SET recovery_count = recovery_count + 1 WHERE id = ? RETURNING recovery_count")
+    .get(messageId) as { recovery_count: number } | undefined;
+  return row?.recovery_count ?? 0;
 }
 
 /** Get the most recent N messages for a group, oldest first. */

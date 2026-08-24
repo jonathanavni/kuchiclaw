@@ -72,6 +72,16 @@ export const MCP_SERVERS_PATH = path.join(PROJECT_ROOT, "mcp-servers.json");
 /** Task scheduler polling interval (ms) */
 export const SCHEDULER_POLL_MS = 60_000;
 
+/** How often the runtime sweep looks for messages stranded in 'processing' (ms). */
+export const STUCK_SWEEP_MS = 5 * 60_000;
+
+/** A 'processing' message older than this (s) has no live job — the sweep re-enqueues it.
+ *  Must exceed the container timeout by a comfortable margin so live jobs are never swept. */
+export const STUCK_THRESHOLD_SEC = 15 * 60;
+
+/** Max times a message may be re-enqueued by recovery/sweep before it's failed permanently. */
+export const MAX_RECOVERY_ATTEMPTS = 3;
+
 /** Channel-qualified chat ID that maps to the "main" group (e.g., "tg-123456789"). */
 export const MAIN_CHAT_ID = process.env.MAIN_CHAT_ID ?? "";
 

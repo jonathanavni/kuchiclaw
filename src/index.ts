@@ -15,10 +15,13 @@ import {
   initializeIpcLayoutEpoch,
   insertMessage,
   getOrphanedMessages,
+  getStuckProcessingMessages,
+  incrementRecoveryCount,
   inspectDbAttestation,
   IPC_LAYOUT_DB_VERSION,
   updateMessageStatus,
   type DbAttestation,
+  type Message,
 } from "./db.js";
 import { enqueue, shutdown as shutdownQueue } from "./group-queue.js";
 import { registerSender } from "./ipc.js";
@@ -36,6 +39,9 @@ import {
   MAIN_CHAT_ID,
   SHUTDOWN_TIMEOUT_MS,
   MCP_SERVERS_PATH,
+  STUCK_SWEEP_MS,
+  STUCK_THRESHOLD_SEC,
+  MAX_RECOVERY_ATTEMPTS,
 } from "./config.js";
 import {
   assertDestinationAllowed,
@@ -212,6 +218,7 @@ export async function main(startupOptions: StartupGateOptions = {}): Promise<voi
   await channel.connect();
   startPolling();
   startScheduler({ secrets, channel, mcpServers, model });
+  startStuckSweep({ secrets, channel, mcpServers, model });
   console.log("[Orchestrator] KuchiClaw is running. Press Ctrl+C to stop.");
 
   // Graceful shutdown: stop accepting → stop IPC → wait for running containers → exit
@@ -221,10 +228,11 @@ export async function main(startupOptions: StartupGateOptions = {}): Promise<voi
     shuttingDown = true;
     console.log("\n[Orchestrator] Shutting down...");
 
-    // Stop receiving new messages, IPC polling, and scheduler
+    // Stop receiving new messages, IPC polling, scheduler, and the stuck sweep
     await channel.disconnect();
     stopPolling();
     stopScheduler();
+    stopStuckSweep();
 
     // Wait for running containers to finish, with a hard timeout
     const finished = shutdownQueue();
@@ -272,43 +280,80 @@ interface RecoveryOptions {
   model?: string;
 }
 
+/**
+ * Re-enqueue one orphaned/stuck message, applying the replay cap. A message that
+ * has already been recovered MAX_RECOVERY_ATTEMPTS times is failed permanently
+ * instead of re-enqueued, so one that reliably crashes the container (or has an
+ * unresolvable destination) can't replay forever across restarts and sweeps.
+ * Returns true if it was re-enqueued.
+ */
+function reEnqueueOrphan(msg: Message, options: RecoveryOptions, source: string): boolean {
+  const chatId = msg.chat_id ?? groupToChatId(msg.group_folder);
+  try {
+    if (!chatId) throw new Error("chat ID cannot be resolved");
+    assertDestinationAllowed(msg.group_folder, msg.group_folder === "main", chatId);
+  } catch (err) {
+    console.error(`[${source}] REFUSING message ${msg.id} with invalid destination identity: ${err}`);
+    updateMessageStatus(msg.id, "failed");
+    return false;
+  }
+
+  if (msg.recovery_count >= MAX_RECOVERY_ATTEMPTS) {
+    console.error(`[${source}] Message ${msg.id} exhausted ${MAX_RECOVERY_ATTEMPTS} recovery attempts — failing permanently`);
+    updateMessageStatus(msg.id, "failed");
+    return false;
+  }
+
+  const attempt = incrementRecoveryCount(msg.id);
+  console.log(`[${source}] Re-enqueueing message ${msg.id} (group: ${msg.group_folder}, recovery ${attempt}/${MAX_RECOVERY_ATTEMPTS})`);
+  updateMessageStatus(msg.id, "pending");
+  enqueue({
+    group: msg.group_folder,
+    chatId: chatId!,
+    senderName: msg.sender_name ?? "Unknown",
+    text: msg.content,
+    secrets: options.secrets,
+    channel: options.channel,
+    mcpServers: options.mcpServers,
+    model: options.model,
+    attempt: 1,
+    messageId: msg.id,
+  });
+  return true;
+}
+
 export function recoverOrphanedMessages(options: RecoveryOptions): void {
   const orphans = getOrphanedMessages();
   if (orphans.length > 0) {
     console.log(`[Recovery] Found ${orphans.length} orphaned message(s) — re-enqueueing`);
-    for (const msg of orphans) {
-      const chatId = msg.chat_id ?? groupToChatId(msg.group_folder);
-      try {
-        if (!chatId) throw new Error("chat ID cannot be resolved");
-        assertDestinationAllowed(
-          msg.group_folder,
-          msg.group_folder === "main",
-          chatId,
-        );
-      } catch (err) {
-        console.error(
-          `[Recovery] REFUSING message ${msg.id} with invalid destination identity: ${err}`,
-        );
-        updateMessageStatus(msg.id, "failed");
-        continue;
-      }
-      console.log(`[Recovery] Re-enqueueing message ${msg.id} (group: ${msg.group_folder}): "${msg.content.slice(0, 60)}..."`);
-      updateMessageStatus(msg.id, "pending");
-      enqueue({
-        group: msg.group_folder,
-        chatId,
-        senderName: msg.sender_name ?? "Unknown",
-        text: msg.content,
-        secrets: options.secrets,
-        channel: options.channel,
-        mcpServers: options.mcpServers,
-        model: options.model,
-        attempt: 1,
-        messageId: msg.id,
-      });
-    }
+    for (const msg of orphans) reEnqueueOrphan(msg, options, "Recovery");
   }
+}
 
+let sweepTimer: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * Periodic sweep for messages stranded in 'processing' while the orchestrator is
+ * live (e.g. a container was killed but its status never reset, or a post-run DB
+ * throw left it half-done). Startup recovery only runs once; this catches strays
+ * that appear during a long-running session.
+ */
+export function startStuckSweep(options: RecoveryOptions): void {
+  const sweep = () => {
+    const stuck = getStuckProcessingMessages(STUCK_THRESHOLD_SEC);
+    if (stuck.length > 0) {
+      console.log(`[Sweep] Found ${stuck.length} stuck 'processing' message(s)`);
+      for (const msg of stuck) reEnqueueOrphan(msg, options, "Sweep");
+    }
+  };
+  sweepTimer = setInterval(sweep, STUCK_SWEEP_MS);
+}
+
+export function stopStuckSweep(): void {
+  if (sweepTimer) {
+    clearInterval(sweepTimer);
+    sweepTimer = null;
+  }
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
