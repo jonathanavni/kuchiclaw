@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Export OAuth tokens from macOS keychain to data/oauth.json.
 # Run locally on your Mac: bash deploy/export-oauth.sh
+#
+# DEPRECATED as the VPS credential source: exporting the keychain tokens shares the
+# refresh lineage with this Mac, so each side's refresh invalidates the other's tokens
+# (auth crash-loops). Provision the VPS with a dedicated grant instead:
+#   claude setup-token   → set the result as CLAUDE_CODE_OAUTH_TOKEN in /opt/kuchiclaw/.env
+# Kept only as a break-glass fallback for the oauth.json path.
 set -euo pipefail
 
 OAUTH_PATH="data/oauth.json"

@@ -89,7 +89,7 @@ async function executeJob(job: Job): Promise<void> {
   const paths = ensureGroupFolder(group);
 
   // Refresh auth on every job — tokens expire and the process is long-lived
-  const { secrets, isApiKeyFallback } = await getSecrets();
+  const { secrets, isApiKeyFallback, source } = await getSecrets();
   const model = isApiKeyFallback ? "claude-sonnet-4-6" : job.model;
 
   // Load history before this run (user message already stored by caller)
@@ -102,8 +102,11 @@ async function executeJob(job: Job): Promise<void> {
     chatId,
     secrets,
     // Refresh token lets the container self-heal when the access token is stale —
-    // containers can reach platform.claude.com even when the VPS host is blocked
-    refreshToken: getRefreshToken() ?? undefined,
+    // containers can reach platform.claude.com even when the VPS host is blocked.
+    // Only on the oauth.json path: a container refresh overrides the access token
+    // (entrypoint), so passing it alongside a dedicated env-token grant would let a
+    // stale oauth.json lineage clobber the grant — the exact crash-loop P4.1 removes.
+    refreshToken: source === "oauth-json" ? getRefreshToken() ?? undefined : undefined,
     messageHistory: messageHistory || undefined,
     mcpServers: job.mcpServers,
     model,

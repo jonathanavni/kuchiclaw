@@ -15,7 +15,7 @@ Minimal AI agent framework inspired by NanoClaw/OpenClaw. Node.js + TypeScript +
 - Filesystem-based IPC (containers write JSON → host polls/validates/executes)
 - SQLite for persistent state (messages, sessions, groups, tasks)
 - Five living files: SOUL.md (identity, global, ro), TOOLS.md (capabilities, global, ro), MEMORY.md (durable facts, per-group, rw), CONTEXT.md (session scratchpad, per-group, rw), HEARTBEAT.md (self-maintenance checklist, global, ro)
-- Authentication via Claude Max OAuth token with auto-refresh (`data/oauth.json`), fallback to `ANTHROPIC_API_KEY` env var (auto-downgrades to Sonnet 4.6 to reduce costs), then macOS keychain (local dev). Access token + refresh token passed to containers via stdin; containers refresh the token themselves (VPS host is Cloudflare-blocked from `platform.claude.com`, containers are not) and return new tokens in output for the host to persist
+- Authentication priority: explicit `CLAUDE_CODE_OAUTH_TOKEN` env var (a dedicated `claude setup-token` grant — the VPS primary path, own refresh lineage) → Claude Max OAuth auto-refresh (`data/oauth.json`) → `ANTHROPIC_API_KEY` env var (auto-downgrades to Sonnet 4.6 to reduce costs) → macOS keychain (local dev). On the oauth.json path only, access + refresh tokens are passed to containers via stdin; containers refresh the token themselves (VPS host is Cloudflare-blocked from `platform.claude.com`, containers are not) and return new tokens in output for the host to persist. The refresh token is never passed alongside an env-token grant — mixing lineages causes auth crash-loops
 - Container runs as non-root `agent` user (Claude Code refuses bypassPermissions as root)
 - Telegram as primary messaging channel
 

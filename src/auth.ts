@@ -1,5 +1,5 @@
 // Authentication helpers — shared by cli.ts and index.ts.
-// Priority: OAuth auto-refresh > ANTHROPIC_API_KEY env var > macOS keychain.
+// Priority: explicit CLAUDE_CODE_OAUTH_TOKEN > OAuth auto-refresh > ANTHROPIC_API_KEY > macOS keychain.
 
 import { execSync } from "node:child_process";
 import { getOAuthToken } from "./oauth-refresh.js";
@@ -18,44 +18,57 @@ function readTokenFromKeychain(): string | null {
   }
 }
 
+/** Which credential path won — callers gate lineage-specific behavior on this */
+export type AuthSource = "env-token" | "oauth-json" | "api-key" | "keychain";
+
 export interface AuthResult {
   secrets: Record<string, string>;
   /** True when using ANTHROPIC_API_KEY (paid) instead of OAuth (free with Claude Max) */
   isApiKeyFallback: boolean;
+  source: AuthSource;
 }
 
-/** Resolve auth secrets. Priority: oauth.json (auto-refresh) > env vars > macOS keychain. */
+/** Resolve auth secrets. Priority: CLAUDE_CODE_OAUTH_TOKEN env > oauth.json (auto-refresh) > API key > keychain. */
 export async function getSecrets(): Promise<AuthResult> {
   const secrets: Record<string, string> = {};
   let isApiKeyFallback = false;
+  let source: AuthSource;
 
-  // 1. Try OAuth auto-refresh (data/oauth.json)
-  const oauthToken = await getOAuthToken();
-  if (oauthToken) {
-    secrets.CLAUDE_CODE_OAUTH_TOKEN = oauthToken;
-  }
-  // 2. Env var overrides (API key — paid fallback, use cheaper model)
-  else if (process.env.ANTHROPIC_API_KEY) {
-    secrets.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-    isApiKeyFallback = true;
-    console.warn("[Auth] OAuth unavailable, falling back to ANTHROPIC_API_KEY (Sonnet)");
-  }
-  // 3. Env var fallback for OAuth token
-  else if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
+  // 1. Explicit env token (a dedicated `claude setup-token` grant — the VPS primary path).
+  //    Must win over oauth.json: each grant has its own refresh lineage, and letting a stale
+  //    oauth.json shadow an explicit grant is the documented cause of auth crash-loops.
+  if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
     secrets.CLAUDE_CODE_OAUTH_TOKEN = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    source = "env-token";
   }
-  // 4. macOS keychain (local dev)
+  // 2. OAuth auto-refresh (data/oauth.json)
   else {
-    const keychainToken = readTokenFromKeychain();
-    if (keychainToken) {
-      secrets.CLAUDE_CODE_OAUTH_TOKEN = keychainToken;
-    } else {
-      console.error(
-        "Error: No auth token found.\n" +
-        "Provide data/oauth.json (OAuth refresh), set ANTHROPIC_API_KEY or\n" +
-        "CLAUDE_CODE_OAUTH_TOKEN in your environment, or log in to Claude Code."
-      );
-      process.exit(1);
+    const oauthToken = await getOAuthToken();
+    if (oauthToken) {
+      secrets.CLAUDE_CODE_OAUTH_TOKEN = oauthToken;
+      source = "oauth-json";
+    }
+    // 3. API key (paid fallback, use cheaper model)
+    else if (process.env.ANTHROPIC_API_KEY) {
+      secrets.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+      isApiKeyFallback = true;
+      source = "api-key";
+      console.warn("[Auth] OAuth unavailable, falling back to ANTHROPIC_API_KEY (Sonnet)");
+    }
+    // 4. macOS keychain (local dev)
+    else {
+      const keychainToken = readTokenFromKeychain();
+      if (keychainToken) {
+        secrets.CLAUDE_CODE_OAUTH_TOKEN = keychainToken;
+        source = "keychain";
+      } else {
+        console.error(
+          "Error: No auth token found.\n" +
+          "Set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY in your environment,\n" +
+          "provide data/oauth.json (OAuth refresh), or log in to Claude Code."
+        );
+        process.exit(1);
+      }
     }
   }
 
@@ -64,5 +77,5 @@ export async function getSecrets(): Promise<AuthResult> {
     secrets.FASTMAIL_API_TOKEN = process.env.FASTMAIL_API_TOKEN;
   }
 
-  return { secrets, isApiKeyFallback };
+  return { secrets, isApiKeyFallback, source };
 }
