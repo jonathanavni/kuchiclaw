@@ -10,7 +10,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { TelegramChannel } from "./channels/telegram.js";
 import { getSecrets, AuthUnavailableError } from "./auth.js";
-import { enforceStartupBackoff, resetCircuitBreaker } from "./circuit-breaker.js";
+import { enforceStartupBackoff } from "./circuit-breaker.js";
 import {
   initializeIpcLayoutEpoch,
   insertMessage,
@@ -236,8 +236,9 @@ export async function main(startupOptions: StartupGateOptions = {}): Promise<voi
     );
 
     await Promise.race([finished, timeout]);
-    // Clean shutdown — clear the crash-loop breaker so the next start is attempt 1.
-    resetCircuitBreaker();
+    // No breaker reset here: the breaker's start-ledger is time-pruned to the same
+    // window systemd counts over, so a clean restart stays in sync with systemd
+    // instead of desyncing it (a reset would let systemd trip on the next crash).
     console.log("[Orchestrator] Goodbye.");
     process.exit(0);
   };

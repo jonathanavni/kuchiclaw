@@ -80,11 +80,17 @@ function drain(group: string): void {
   const job = queue.shift()!;
   running.set(group, count + 1);
 
-  const promise = executeJob(job).finally(() => {
-    activeJobs.delete(promise);
-    running.set(group, (running.get(group) ?? 1) - 1);
-    drain(group);
-  });
+  const promise = executeJob(job)
+    .catch((err) => {
+      // executeJob handles its own failures; this is a last-resort backstop so an
+      // unexpected throw can never surface as an unhandled rejection.
+      console.error(`[Queue] Unexpected job failure: ${err instanceof Error ? err.message : err}`);
+    })
+    .finally(() => {
+      activeJobs.delete(promise);
+      running.set(group, (running.get(group) ?? 1) - 1);
+      drain(group);
+    });
 
   activeJobs.add(promise);
 }
@@ -179,24 +185,33 @@ async function executeJob(job: Job): Promise<void> {
     return;
   }
 
-  // Container ran to completion — persist the result FIRST, then deliver. If
-  // delivery fails, the result is already stored and onComplete still fires.
-  if (output.status === "success") {
-    const result = output.result ?? "(no response)";
-    // Persist the result BEFORE marking the user message done. If we marked done
-    // first and crashed before the insert, recovery would skip a message that has
-    // no stored reply (a silent drop). This order downgrades that to at worst a
-    // re-run (duplicate reply) on crash — strictly safer.
-    insertMessage(group, "assistant", result);
-    if (job.messageId) updateMessageStatus(job.messageId, "done");
-    await deliver(channel, chatId, result);
-    job.onComplete?.(result);
-  } else {
-    // Agent-level error (not a container crash) — don't retry
-    if (job.messageId) updateMessageStatus(job.messageId, "failed");
-    const errMsg = `Error: ${output.error ?? "unknown error"}`;
-    console.error(`[Queue] Agent error: ${errMsg}`);
-    await deliver(channel, chatId, errMsg);
+  // Container ran to completion. Persisting/delivering can still throw (e.g. a
+  // SQLite error); catch it so it never becomes an unhandled rejection that the
+  // process-level guard has to absorb. We deliberately do NOT touch message
+  // status here — leaving a half-processed message as 'processing' lets crash
+  // recovery replay it rather than silently dropping the reply.
+  try {
+    if (output.status === "success") {
+      const result = output.result ?? "(no response)";
+      // Persist the result BEFORE marking the user message done. If we marked done
+      // first and crashed before the insert, recovery would skip a message that has
+      // no stored reply (a silent drop). This order downgrades that to at worst a
+      // re-run (duplicate reply) on crash — strictly safer.
+      insertMessage(group, "assistant", result);
+      if (job.messageId) updateMessageStatus(job.messageId, "done");
+      await deliver(channel, chatId, result);
+      job.onComplete?.(result);
+    } else {
+      // Agent-level error (not a container crash) — don't retry
+      if (job.messageId) updateMessageStatus(job.messageId, "failed");
+      const errMsg = `Error: ${output.error ?? "unknown error"}`;
+      console.error(`[Queue] Agent error: ${errMsg}`);
+      await deliver(channel, chatId, errMsg);
+      job.onError?.(errMsg);
+    }
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    console.error(`[Queue] Post-run handling failed (result may be unstored/undelivered): ${errMsg}`);
     job.onError?.(errMsg);
   }
 }

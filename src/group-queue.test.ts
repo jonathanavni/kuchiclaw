@@ -75,7 +75,7 @@ beforeEach(() => {
 });
 
 describe("group-queue executeJob", () => {
-  it("delivers a successful result and persists it before sending", async () => {
+  it("persists the result, then marks done, then sends — in that order", async () => {
     vi.mocked(runContainer).mockResolvedValue({ status: "success", result: "the answer" });
     const channel = makeChannel();
 
@@ -85,6 +85,33 @@ describe("group-queue executeJob", () => {
     expect(insertMessage).toHaveBeenCalledWith("tg-123", "assistant", "the answer");
     expect(channel.sendMessage).toHaveBeenCalledWith("123", "the answer");
     expect(runContainer).toHaveBeenCalledTimes(1);
+
+    // Ordering guards the silent-drop fix: the assistant result must be stored
+    // before the user message is marked done, and done before the send.
+    const insertOrder = vi.mocked(insertMessage).mock.invocationCallOrder[0];
+    const doneCall = vi.mocked(updateMessageStatus).mock.calls.findIndex((c) => c[1] === "done");
+    const doneOrder = vi.mocked(updateMessageStatus).mock.invocationCallOrder[doneCall];
+    const sendOrder = channel.sendMessage.mock.invocationCallOrder[0];
+    expect(insertOrder).toBeLessThan(doneOrder);
+    expect(doneOrder).toBeLessThan(sendOrder);
+  });
+
+  it("does not mark the user message done if persisting the result throws", async () => {
+    vi.mocked(runContainer).mockResolvedValue({ status: "success", result: "x" });
+    vi.mocked(insertMessage).mockImplementationOnce(() => { throw new Error("db down"); });
+
+    // The job rejects/settles; assert the user message was never marked done
+    // (so crash recovery can still replay it — no silent drop).
+    await new Promise<void>((resolve) => {
+      enqueue({
+        group: "tg-123", chatId: "123", senderName: "t", text: "x", secrets: {},
+        channel: makeChannel() as never, attempt: 1, messageId: 5,
+        onComplete: () => resolve(), onError: () => resolve(),
+      });
+      setTimeout(resolve, 50);
+    });
+    const doneMarked = vi.mocked(updateMessageStatus).mock.calls.some((c) => c[0] === 5 && c[1] === "done");
+    expect(doneMarked).toBe(false);
   });
 
   it("a delivery failure never re-runs the container (result already persisted)", async () => {

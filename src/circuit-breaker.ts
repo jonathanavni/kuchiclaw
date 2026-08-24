@@ -6,22 +6,16 @@
 //      unit into a permanent `failed` state over a passing blip.
 //   2. ALERT on a PERSISTENT loop. The operator added systemd's StartLimit
 //      specifically because an OAuth crash-loop once ran silently for 8 days
-//      (see kuchiclaw.service). Since the backoff below is deliberately tuned so
-//      the StartLimit no longer trips (and so its OnFailure alert no longer
-//      fires), the breaker itself raises the alarm once the loop is clearly not
-//      transient. systemd's StartLimit stays as a failsafe for the case where
-//      the breaker itself can't run.
+//      (see kuchiclaw.service). Since the backoff below keeps StartLimit from
+//      tripping (so its OnFailure alert no longer fires), the breaker raises the
+//      alarm itself. StartLimit stays as a failsafe for when the breaker can't run.
 //
-// Backoff tuning: with systemd's StartLimitBurst=5 / StartLimitIntervalSec=300 /
-// RestartSec=5, the unit permanently fails if 6 starts land inside any 300s
-// window. A startup-phase crash happens right after this backoff, so successive
-// starts are spaced by (sleep + RestartSec). We keep the first two retries fast
-// (real transients recover), then escalate so that the time to the 6th start
-// exceeds 300s: sum(sleeps[0..4]) + 5*RestartSec = 300 + 25 > 300. See the
-// systemd-scenario test.
-//
-// Adapted from NanoClaw's circuit-breaker.ts. Runs before anything else in
-// main() — it only reads/sleeps/writes its own file (plus a best-effort alert).
+// State is a rolling ledger of recent start timestamps — the SAME thing systemd's
+// StartLimit counts (any start within StartLimitIntervalSec), so the breaker's
+// view can't desync from systemd's across clean restarts and redeploys. The
+// backoff is indexed by how many starts fall inside that window; a startup-phase
+// crash happens right after the sleep, so spacing the sleeps guarantees 6 starts
+// never fit in the window (see the systemd-spacing test).
 
 import fs from "node:fs";
 import path from "node:path";
@@ -30,42 +24,33 @@ import { DATA_DIR, PROJECT_ROOT } from "./config.js";
 
 const CB_PATH = path.join(DATA_DIR, "circuit-breaker.json");
 
-/** A startup within this window of the previous one counts as a crash-loop restart. */
-const RESET_WINDOW_MS = 60 * 60 * 1000;
+/** Must mirror kuchiclaw.service StartLimitIntervalSec — the window systemd counts starts over. */
+const WINDOW_MS = 300 * 1000;
 
-/** Backoff seconds indexed by consecutive-crash count (attempt 1 = clean start = 0s). 6+ capped at 15min. */
+/** Backoff seconds indexed by (starts-in-window − 1). Two fast retries for real transients, then escalate. */
 const BACKOFF_SCHEDULE_S = [0, 0, 30, 90, 180, 300, 900];
 
-/** Consecutive-crash count at which the loop is clearly persistent — raise the alarm. */
+/** Starts-in-window at which the loop is clearly persistent — raise the alarm. */
 const ALERT_ATTEMPT = 4;
 
-interface CircuitBreakerState {
-  attempt: number;
-  timestamp: string;
-}
+/** Minimum spacing between alert attempts once one succeeds (durable rate limit). */
+const ALERT_COOLDOWN_MS = 15 * 60 * 1000;
 
-/**
- * Best-effort persistent-crash-loop alert. Runs only under systemd (INVOCATION_ID
- * is set by systemd, absent in dev/tests), reusing the same detached alert script
- * systemd's OnFailure would have used. Never throws, never blocks startup.
- */
-function defaultAlert(): void {
-  if (!process.env.INVOCATION_ID) return; // not systemd-managed (dev/test)
-  try {
-    const child = spawn("bash", [path.join(PROJECT_ROOT, "deploy", "alert.sh"), "kuchiclaw.service"], {
-      detached: true,
-      stdio: "ignore",
-    });
-    child.on("error", () => {});
-    child.unref();
-  } catch {
-    // Alerting is best-effort — never let it interfere with startup.
-  }
+/** Hard cap on how long we wait for the alert child before treating it as failed. */
+const ALERT_TIMEOUT_MS = 15 * 1000;
+
+interface CircuitBreakerState {
+  /** Epoch ms of recent starts, pruned to the window. */
+  starts: number[];
+  /** Epoch ms of the last SUCCESSFUL alert — a failed alert is retried on the next crash. */
+  lastAlertAt?: number;
 }
 
 function read(cbPath: string): CircuitBreakerState | null {
   try {
-    return JSON.parse(fs.readFileSync(cbPath, "utf-8")) as CircuitBreakerState;
+    const parsed = JSON.parse(fs.readFileSync(cbPath, "utf-8"));
+    if (!Array.isArray(parsed.starts)) return null;
+    return parsed as CircuitBreakerState;
   } catch {
     return null;
   }
@@ -77,12 +62,22 @@ function write(cbPath: string, state: CircuitBreakerState): void {
   fs.writeFileSync(cbPath, JSON.stringify(state, null, 2) + "\n");
 }
 
-function delayForAttempt(attempt: number): number {
-  const idx = Math.min(attempt - 1, BACKOFF_SCHEDULE_S.length - 1);
-  return BACKOFF_SCHEDULE_S[Math.max(idx, 0)];
+/**
+ * Pure: given the prior start ledger and the current time, compute the pruned
+ * ledger (with this start appended), the in-window start count, and the backoff.
+ * Exported for tests and the systemd-spacing invariant.
+ */
+export function planStartup(
+  prevStarts: number[],
+  nowMs: number,
+): { starts: number[]; attempt: number; delaySec: number } {
+  const starts = [...prevStarts.filter((t) => t > nowMs - WINDOW_MS), nowMs];
+  const attempt = starts.length;
+  const delaySec = BACKOFF_SCHEDULE_S[Math.min(attempt - 1, BACKOFF_SCHEDULE_S.length - 1)];
+  return { starts, attempt, delaySec };
 }
 
-/** Clear the breaker — called on a clean shutdown so the next start is treated as attempt 1. */
+/** Manually clear the breaker (ops utility — NOT called on clean shutdown; the time window handles that). */
 export function resetCircuitBreaker(cbPath = CB_PATH): void {
   try {
     fs.unlinkSync(cbPath);
@@ -92,22 +87,25 @@ export function resetCircuitBreaker(cbPath = CB_PATH): void {
 }
 
 /**
- * Compute the next attempt count and its backoff from prior state, without sleeping.
- * Exported for tests and reuse; `enforceStartupBackoff` wraps it with the actual wait.
+ * Best-effort persistent-crash-loop alert. Returns whether it was delivered, so
+ * a failed alert is retried on the next crash instead of leaving the outage
+ * silent. Runs only under systemd (INVOCATION_ID); in dev/test it is a no-op that
+ * reports success (nothing to deliver, nothing to retry).
  */
-export function nextBackoff(
-  prev: CircuitBreakerState | null,
-  now: Date,
-): { attempt: number; delaySec: number } {
-  let attempt: number;
-  if (!prev) {
-    attempt = 1;
-  } else {
-    const elapsedMs = now.getTime() - new Date(prev.timestamp).getTime();
-    // A recent prior start with no clean shutdown in between = a crash-loop restart.
-    attempt = elapsedMs < RESET_WINDOW_MS ? prev.attempt + 1 : 1;
-  }
-  return { attempt, delaySec: delayForAttempt(attempt) };
+async function defaultAlert(): Promise<boolean> {
+  if (!process.env.INVOCATION_ID) return true;
+  return new Promise<boolean>((resolve) => {
+    try {
+      const child = spawn("bash", [path.join(PROJECT_ROOT, "deploy", "alert.sh"), "kuchiclaw.service"], {
+        stdio: "ignore",
+      });
+      const timer = setTimeout(() => { child.kill("SIGKILL"); resolve(false); }, ALERT_TIMEOUT_MS);
+      child.on("error", () => { clearTimeout(timer); resolve(false); });
+      child.on("exit", (code) => { clearTimeout(timer); resolve(code === 0); });
+    } catch {
+      resolve(false);
+    }
+  });
 }
 
 /**
@@ -118,35 +116,36 @@ export async function enforceStartupBackoff(opts: {
   cbPath?: string;
   now?: () => Date;
   sleep?: (ms: number) => Promise<void>;
-  alert?: () => void;
+  alert?: () => Promise<boolean>;
 } = {}): Promise<void> {
   const cbPath = opts.cbPath ?? CB_PATH;
-  const now = (opts.now ?? (() => new Date()))();
+  const nowMs = (opts.now ?? (() => new Date()))().getTime();
   const sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   const alert = opts.alert ?? defaultAlert;
 
   const prev = read(cbPath);
-  const { attempt, delaySec } = nextBackoff(prev, now);
+  const { starts, attempt, delaySec } = planStartup(prev?.starts ?? [], nowMs);
+  const state: CircuitBreakerState = { starts, lastAlertAt: prev?.lastAlertAt };
 
-  if (prev && attempt > 1) {
-    console.warn(
-      `[Breaker] Previous startup was not a clean shutdown (attempt ${attempt}); prior at ${prev.timestamp}`,
-    );
+  if (attempt > 1) {
+    console.warn(`[Breaker] ${attempt} starts within the crash-loop window`);
   }
 
-  write(cbPath, { attempt, timestamp: now.toISOString() });
-
-  // Raise the alarm once, as the loop crosses from transient into persistent —
-  // systemd's OnFailure alert no longer fires because the backoff keeps the unit
-  // from tripping StartLimit.
-  if (attempt === ALERT_ATTEMPT) {
-    console.error(`[Breaker] Persistent crash-loop (attempt ${attempt}) — alerting operator`);
-    alert();
+  // Persistent loop: alert, retrying on later crashes until one lands, then cool down.
+  if (attempt >= ALERT_ATTEMPT) {
+    const cooled = !state.lastAlertAt || nowMs - state.lastAlertAt > ALERT_COOLDOWN_MS;
+    if (cooled) {
+      console.error(`[Breaker] Persistent crash-loop (${attempt} starts) — alerting operator`);
+      if (await alert()) state.lastAlertAt = nowMs;
+      else console.error("[Breaker] Alert delivery failed — will retry on the next crash");
+    }
   }
+
+  write(cbPath, state);
 
   if (delaySec > 0) {
-    console.warn(`[Breaker] Crash-loop backoff: delaying startup ${delaySec}s (attempt ${attempt})`);
+    console.warn(`[Breaker] Crash-loop backoff: delaying startup ${delaySec}s (${attempt} recent starts)`);
     await sleep(delaySec * 1000);
-    console.log(`[Breaker] Backoff complete, resuming startup (attempt ${attempt})`);
+    console.log(`[Breaker] Backoff complete, resuming startup`);
   }
 }
