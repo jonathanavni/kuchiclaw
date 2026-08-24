@@ -23,7 +23,7 @@ import {
   type DbAttestation,
   type Message,
 } from "./db.js";
-import { enqueue, shutdown as shutdownQueue } from "./group-queue.js";
+import { enqueue, shutdown as shutdownQueue, isMessageInFlight } from "./group-queue.js";
 import { registerSender } from "./ipc.js";
 import {
   quarantineLooseRootRequests,
@@ -340,7 +340,14 @@ let sweepTimer: ReturnType<typeof setInterval> | null = null;
  */
 export function startStuckSweep(options: RecoveryOptions): void {
   const sweep = () => {
-    const stuck = getStuckProcessingMessages(STUCK_THRESHOLD_SEC);
+    // Skip messages a live job is still handling: an old creation timestamp can
+    // also mean "sat in a deep backlog and only just started processing", not
+    // "stranded". Re-enqueueing one of those would re-run the agent (duplicate
+    // side effects) alongside the running container. The in-flight set is the
+    // authority for "currently being worked" within this live process.
+    const stuck = getStuckProcessingMessages(STUCK_THRESHOLD_SEC).filter(
+      (msg) => !isMessageInFlight(msg.id),
+    );
     if (stuck.length > 0) {
       console.log(`[Sweep] Found ${stuck.length} stuck 'processing' message(s)`);
       for (const msg of stuck) reEnqueueOrphan(msg, options, "Sweep");

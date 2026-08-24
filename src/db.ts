@@ -203,7 +203,7 @@ export function incrementRecoveryCount(messageId: number): number {
 /** Get the most recent N messages for a group, oldest first. */
 export function getRecentMessages(groupFolder: string, limit = 20): Message[] {
   const stmt = getDb().prepare(`
-    SELECT id, group_folder, role, content, timestamp, processing_status, chat_id, sender_name
+    SELECT id, group_folder, role, content, timestamp, processing_status, chat_id, sender_name, recovery_count
     FROM messages
     WHERE group_folder = ?
     ORDER BY timestamp DESC, id DESC

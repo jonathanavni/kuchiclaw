@@ -2,7 +2,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
 
 const enqueue = vi.hoisted(() => vi.fn());
-vi.mock("./group-queue.js", () => ({ enqueue, shutdown: vi.fn() }));
+const isMessageInFlight = vi.hoisted(() => vi.fn(() => false));
+vi.mock("./group-queue.js", () => ({ enqueue, shutdown: vi.fn(), isMessageInFlight }));
 
 import { getDb, getRecentMessages, getStuckProcessingMessages, incrementRecoveryCount, resetDb } from "./db.js";
 import { recoverOrphanedMessages, startStuckSweep, stopStuckSweep } from "./index.js";
@@ -26,6 +27,8 @@ function seedMessage(opts: {
 beforeEach(() => {
   resetDb(new Database(":memory:"));
   enqueue.mockClear();
+  isMessageInFlight.mockReset();
+  isMessageInFlight.mockReturnValue(false);
   vi.spyOn(console, "error").mockImplementation(() => {});
   vi.spyOn(console, "log").mockImplementation(() => {});
 });
@@ -90,5 +93,18 @@ describe("runtime stuck sweep", () => {
     stopStuckSweep();
     vi.useRealTimers();
     expect(enqueue).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT sweep an old 'processing' message a live job is still handling", () => {
+    // Old creation time but currently in-flight (deep-backlog job that just
+    // started) — must not be re-executed alongside its running container.
+    vi.useFakeTimers();
+    seedMessage({ ageSec: 20 * 60, status: "processing" });
+    isMessageInFlight.mockReturnValue(true);
+    startStuckSweep(deps());
+    vi.advanceTimersByTime(5 * 60_000);
+    stopStuckSweep();
+    vi.useRealTimers();
+    expect(enqueue).not.toHaveBeenCalled();
   });
 });

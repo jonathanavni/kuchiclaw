@@ -45,6 +45,26 @@ const running = new Map<string, number>();
 /** All currently running job promises — used for graceful shutdown */
 const activeJobs = new Set<Promise<void>>();
 
+/** Ref-count of live jobs handling each message — the stuck sweep skips these so
+ *  it can't re-execute a message that's only slow (deep backlog), not stranded.
+ *  A count (not a set) because a container-error retry briefly overlaps the
+ *  outgoing job for the same message. */
+const inFlightMessageIds = new Map<number, number>();
+
+function addInFlight(id: number): void {
+  inFlightMessageIds.set(id, (inFlightMessageIds.get(id) ?? 0) + 1);
+}
+function removeInFlight(id: number): void {
+  const n = (inFlightMessageIds.get(id) ?? 1) - 1;
+  if (n <= 0) inFlightMessageIds.delete(id);
+  else inFlightMessageIds.set(id, n);
+}
+
+/** Is a live in-process job currently handling this message? (Used by the stuck sweep.) */
+export function isMessageInFlight(messageId: number): boolean {
+  return inFlightMessageIds.has(messageId);
+}
+
 let accepting = true;
 
 /** Enqueue a job and immediately try to drain. */
@@ -79,6 +99,7 @@ function drain(group: string): void {
 
   const job = queue.shift()!;
   running.set(group, count + 1);
+  if (job.messageId !== undefined) addInFlight(job.messageId);
 
   const promise = executeJob(job)
     .catch((err) => {
@@ -88,6 +109,7 @@ function drain(group: string): void {
     })
     .finally(() => {
       activeJobs.delete(promise);
+      if (job.messageId !== undefined) removeInFlight(job.messageId);
       running.set(group, (running.get(group) ?? 1) - 1);
       drain(group);
     });
