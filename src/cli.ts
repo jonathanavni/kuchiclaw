@@ -9,7 +9,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { runContainer } from "./container-runner.js";
 import { ensureGroupFolder } from "./group-folder.js";
-import { insertMessage, getRecentMessages, formatHistory } from "./db.js";
+import { insertMessage, updateMessageStatus, getRecentMessages, formatHistory } from "./db.js";
 import { getSecrets } from "./auth.js";
 import { isValidGroupName } from "./ipc-auth.js";
 import type { ContainerInput } from "./types.js";
@@ -89,8 +89,10 @@ export async function main() {
   const recentMessages = getRecentMessages(group);
   const messageHistory = formatHistory(recentMessages);
 
-  // Store the user's prompt
-  insertMessage(group, "user", prompt);
+  // Store the user's prompt. The CLI processes it here and now — not via the
+  // orchestrator queue — so give it a terminal status below so the orchestrator's
+  // crash recovery never mistakes a finished CLI prompt for an orphaned work item.
+  const userMsgId = insertMessage(group, "user", prompt);
 
   const input: ContainerInput = {
     prompt,
@@ -107,14 +109,17 @@ export async function main() {
 
     if (output.status === "success") {
       const result = output.result ?? "(no response)";
+      updateMessageStatus(userMsgId, "done");
       // Store the agent's response
       insertMessage(group, "assistant", result);
       console.log(result);
     } else {
+      updateMessageStatus(userMsgId, "failed");
       console.error(`[KuchiClaw] Agent error: ${output.error}`);
       process.exit(1);
     }
   } catch (err) {
+    updateMessageStatus(userMsgId, "failed");
     console.error(`[KuchiClaw] Container error: ${err}`);
     process.exit(1);
   }

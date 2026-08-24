@@ -9,7 +9,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { TelegramChannel } from "./channels/telegram.js";
-import { getSecrets } from "./auth.js";
+import { getSecrets, AuthUnavailableError } from "./auth.js";
+import { enforceStartupBackoff, resetCircuitBreaker } from "./circuit-breaker.js";
 import {
   initializeIpcLayoutEpoch,
   insertMessage,
@@ -52,6 +53,8 @@ export interface StartupGateOptions {
   markerPath?: string;
   inspectDb?: () => DbAttestation;
   initializeEpoch?: () => void;
+  /** Tests skip the crash-loop backoff (which would otherwise read/write real breaker state). */
+  skipBackoff?: boolean;
 }
 
 /** Validate both cutover factors before any orchestrator side effect. */
@@ -135,6 +138,11 @@ function loadMcpServers(): Record<string, McpServerConfig> | undefined {
 }
 
 export async function main(startupOptions: StartupGateOptions = {}): Promise<void> {
+  // Back off inside the process when crash-looping, so systemd's StartLimit
+  // never trips the unit into a permanent `failed` state. First thing we do —
+  // it only touches its own state file. Skippable in tests via startupOptions.
+  if (startupOptions.skipBackoff !== true) await enforceStartupBackoff();
+
   enforceStartupGate(startupOptions);
   quarantineLooseRootRequests();
 
@@ -224,12 +232,32 @@ export async function main(startupOptions: StartupGateOptions = {}): Promise<voi
     );
 
     await Promise.race([finished, timeout]);
+    // Clean shutdown — clear the crash-loop breaker so the next start is attempt 1.
+    resetCircuitBreaker();
     console.log("[Orchestrator] Goodbye.");
     process.exit(0);
   };
 
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+}
+
+/**
+ * Keep the long-running orchestrator alive through stray async failures.
+ * - unhandledRejection is almost always a detached fire-and-forget promise
+ *   (e.g. a Telegram send/typing call) — log loudly and carry on; crashing the
+ *   whole process over one dropped reply is the audited crash-loop bug.
+ * - uncaughtException leaves the process in an undefined state, so log and let
+ *   systemd restart it — the circuit breaker prevents a tight restart loop.
+ */
+export function installProcessGuards(): void {
+  process.on("unhandledRejection", (reason) => {
+    console.error("[Orchestrator] Unhandled promise rejection (continuing):", reason);
+  });
+  process.on("uncaughtException", (err) => {
+    console.error("[Orchestrator] Uncaught exception — exiting for a clean restart:", err);
+    process.exit(1);
+  });
 }
 
 interface RecoveryOptions {
@@ -279,6 +307,7 @@ export function recoverOrphanedMessages(options: RecoveryOptions): void {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  installProcessGuards();
   main().catch((err) => {
     console.error(`[Orchestrator] Startup failed: ${err instanceof Error ? err.message : err}`);
     process.exit(1);

@@ -5,8 +5,14 @@ vi.mock("./oauth-refresh.js", () => ({
   getOAuthToken: vi.fn(),
 }));
 
+// Mock the keychain read so the "no credential anywhere" path is deterministic
+// on a developer Mac (where the real keychain would otherwise return a token).
+vi.mock("node:child_process", () => ({
+  execSync: vi.fn(() => { throw new Error("no keychain in test"); }),
+}));
+
 import { getOAuthToken } from "./oauth-refresh.js";
-import { getSecrets } from "./auth.js";
+import { getSecrets, AuthUnavailableError } from "./auth.js";
 
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -50,6 +56,16 @@ describe("getSecrets priority order", () => {
     expect(result.secrets.ANTHROPIC_API_KEY).toBe("sk-ant-test");
     expect(result.secrets.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
     expect(result.isApiKeyFallback).toBe(true);
+  });
+
+  it("throws AuthUnavailableError (never exits) when no credential is found", async () => {
+    // No env token, no oauth.json, no API key, keychain mocked to fail.
+    // A throw (not process.exit) is the contract that keeps the orchestrator alive.
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    vi.mocked(getOAuthToken).mockResolvedValue(null);
+
+    await expect(getSecrets()).rejects.toBeInstanceOf(AuthUnavailableError);
   });
 
   it("passes FASTMAIL_API_TOKEN through regardless of auth source", async () => {

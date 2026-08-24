@@ -1,69 +1,123 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 
-const mocks = vi.hoisted(() => ({
-  runContainer: vi.fn(),
-  ensureGroupFolder: vi.fn(),
-  getSecrets: vi.fn(),
-  getRefreshToken: vi.fn(),
-  insertMessage: vi.fn(),
-  getRecentMessages: vi.fn(() => []),
-  formatHistory: vi.fn(() => ""),
-  updateMessageStatus: vi.fn(),
-}));
-
+// Fast retry delays so the retry/backoff paths don't make the suite slow.
 vi.mock("./config.js", async () => {
   const actual = await vi.importActual<typeof import("./config.js")>("./config.js");
-  return { ...actual, MAIN_CHAT_ID: "tg-999" };
+  return { ...actual, BASE_RETRY_MS: 1, DELIVERY_BASE_MS: 1, MAX_CONTAINERS_PER_GROUP: 2 };
 });
-vi.mock("./container-runner.js", () => ({ runContainer: mocks.runContainer }));
-vi.mock("./group-folder.js", () => ({ ensureGroupFolder: mocks.ensureGroupFolder }));
-vi.mock("./auth.js", () => ({ getSecrets: mocks.getSecrets }));
-vi.mock("./oauth-refresh.js", () => ({ getRefreshToken: mocks.getRefreshToken }));
+
+// Authorization always passes here — identity validation is covered by ipc-auth tests.
+vi.mock("./ipc-auth.js", () => ({ assertDestinationAllowed: vi.fn() }));
+
+vi.mock("./container-runner.js", () => ({ runContainer: vi.fn() }));
+vi.mock("./group-folder.js", () => ({ ensureGroupFolder: vi.fn(() => ({})) }));
+vi.mock("./oauth-refresh.js", () => ({ getRefreshToken: vi.fn(() => null) }));
 vi.mock("./db.js", () => ({
-  insertMessage: mocks.insertMessage,
-  getRecentMessages: mocks.getRecentMessages,
-  formatHistory: mocks.formatHistory,
-  updateMessageStatus: mocks.updateMessageStatus,
+  insertMessage: vi.fn(() => 1),
+  updateMessageStatus: vi.fn(),
+  getRecentMessages: vi.fn(() => []),
+  formatHistory: vi.fn(() => ""),
 }));
 
+// Real AuthUnavailableError, mockable getSecrets.
+vi.mock("./auth.js", async () => {
+  const actual = await vi.importActual<typeof import("./auth.js")>("./auth.js");
+  return { ...actual, getSecrets: vi.fn() };
+});
+
+import { runContainer } from "./container-runner.js";
+import { getSecrets, AuthUnavailableError } from "./auth.js";
+import { updateMessageStatus, insertMessage } from "./db.js";
 import { enqueue } from "./group-queue.js";
-import type { Channel } from "./channels/registry.js";
+
+const okAuth = { secrets: {}, isApiKeyFallback: false, source: "keychain" as const };
+
+function makeChannel(sendImpl?: (chatId: string, text: string) => Promise<void>) {
+  return {
+    sendMessage: vi.fn(sendImpl ?? (async () => {})),
+    connect: vi.fn(),
+    disconnect: vi.fn(),
+    isConnected: vi.fn(() => true),
+    ownsJid: vi.fn(() => true),
+  };
+}
+
+/** Enqueue and resolve when the job signals completion or error. */
+function runJob(overrides: Record<string, unknown>): Promise<{ result?: string; error?: string }> {
+  return new Promise((resolve) => {
+    enqueue({
+      group: "tg-123",
+      chatId: "123",
+      senderName: "tester",
+      text: "hello",
+      secrets: {},
+      channel: makeChannel() as never,
+      attempt: 1,
+      messageId: 1,
+      onComplete: (result) => resolve({ result }),
+      onError: (error) => resolve({ error }),
+      ...overrides,
+    });
+  });
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
-  mocks.getSecrets.mockResolvedValue({ secrets: {}, isApiKeyFallback: false, source: "env-token" });
+  vi.mocked(getSecrets).mockResolvedValue(okAuth);
 });
 
-describe("queue identity ingress", () => {
-  it("refuses invalid identities before status, container, retry, or reply paths", async () => {
-    const channel = { sendMessage: vi.fn() } as unknown as Channel;
-    const errors = [vi.fn(), vi.fn(), vi.fn()];
-    mocks.runContainer
-      .mockResolvedValueOnce({ status: "success", result: "unreachable" })
-      .mockResolvedValueOnce({ status: "error", error: "unreachable" })
-      .mockRejectedValueOnce(new Error("unreachable"));
+describe("group-queue executeJob", () => {
+  it("delivers a successful result and persists it before sending", async () => {
+    vi.mocked(runContainer).mockResolvedValue({ status: "success", result: "the answer" });
+    const channel = makeChannel();
 
-    for (let index = 0; index < 3; index += 1) {
-      enqueue({
-        group: "tg-123",
-        chatId: "456",
-        senderName: `shape-${index}`,
-        text: "must not run",
-        secrets: {},
-        channel,
-        attempt: index === 2 ? 3 : 1,
-        messageId: index + 1,
-        onError: errors[index],
-      });
-    }
+    const done = await runJob({ channel: channel as never });
 
-    await vi.waitFor(() => expect(errors.every((callback) => callback.mock.calls.length === 1)).toBe(true));
-    expect(mocks.updateMessageStatus.mock.calls).toEqual([
-      [1, "failed"], [2, "failed"], [3, "failed"],
-    ]);
-    expect(mocks.ensureGroupFolder).not.toHaveBeenCalled();
-    expect(mocks.getSecrets).not.toHaveBeenCalled();
-    expect(mocks.runContainer).not.toHaveBeenCalled();
-    expect(channel.sendMessage).not.toHaveBeenCalled();
+    expect(done.result).toBe("the answer");
+    expect(insertMessage).toHaveBeenCalledWith("tg-123", "assistant", "the answer");
+    expect(channel.sendMessage).toHaveBeenCalledWith("123", "the answer");
+    expect(runContainer).toHaveBeenCalledTimes(1);
+  });
+
+  it("a delivery failure never re-runs the container (result already persisted)", async () => {
+    vi.mocked(runContainer).mockResolvedValue({ status: "success", result: "answer" });
+    const channel = makeChannel(async () => { throw new Error("Telegram 429"); });
+
+    const done = await runJob({ channel: channel as never });
+
+    // onComplete still fires — the agent succeeded, delivery is a separate domain
+    expect(done.result).toBe("answer");
+    expect(runContainer).toHaveBeenCalledTimes(1); // NOT retried
+    expect(channel.sendMessage).toHaveBeenCalledTimes(3); // DELIVERY_MAX_RETRIES bounded retry
+    expect(insertMessage).toHaveBeenCalledWith("tg-123", "assistant", "answer");
+  });
+
+  it("fails the job (no container run) when auth is unavailable, without throwing", async () => {
+    vi.mocked(getSecrets).mockRejectedValue(new AuthUnavailableError("no token"));
+
+    const done = await runJob({});
+
+    expect(done.error).toBe("no token");
+    expect(runContainer).not.toHaveBeenCalled();
+    expect(updateMessageStatus).toHaveBeenCalledWith(1, "failed");
+  });
+
+  it("retries a transient container error up to MAX_RETRIES then fails", async () => {
+    vi.mocked(runContainer).mockRejectedValue(new Error("container crashed"));
+
+    const done = await runJob({});
+
+    expect(done.error).toMatch(/container crashed/);
+    expect(runContainer).toHaveBeenCalledTimes(3); // MAX_RETRIES
+    expect(updateMessageStatus).toHaveBeenCalledWith(1, "failed");
+  });
+
+  it("does not retry an auth-classified container error", async () => {
+    vi.mocked(runContainer).mockRejectedValue(new Error("401 unauthorized"));
+
+    const done = await runJob({});
+
+    expect(done.error).toMatch(/unauthorized/);
+    expect(runContainer).toHaveBeenCalledTimes(1); // auth errors are terminal
   });
 });

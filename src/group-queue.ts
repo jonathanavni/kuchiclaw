@@ -7,8 +7,15 @@ import { ensureGroupFolder } from "./group-folder.js";
 import { getSecrets } from "./auth.js";
 import { getRefreshToken } from "./oauth-refresh.js";
 import { insertMessage, getRecentMessages, formatHistory, updateMessageStatus } from "./db.js";
-import { MAX_CONTAINERS_PER_GROUP, MAX_RETRIES, BASE_RETRY_MS } from "./config.js";
+import {
+  MAX_CONTAINERS_PER_GROUP,
+  MAX_RETRIES,
+  BASE_RETRY_MS,
+  DELIVERY_MAX_RETRIES,
+  DELIVERY_BASE_MS,
+} from "./config.js";
 import { assertDestinationAllowed } from "./ipc-auth.js";
+import { AuthUnavailableError } from "./auth.js";
 import type { ContainerInput, McpServerConfig } from "./types.js";
 import type { Channel } from "./channels/registry.js";
 
@@ -97,10 +104,26 @@ async function executeJob(job: Job): Promise<void> {
   }
 
   if (job.messageId) updateMessageStatus(job.messageId, "processing");
-  const paths = ensureGroupFolder(group);
 
-  // Refresh auth on every job — tokens expire and the process is long-lived
-  const { secrets, isApiKeyFallback, source } = await getSecrets();
+  // Refresh auth on every job — tokens expire and the process is long-lived.
+  // A missing credential is transient on the VPS (blocked refresh, stale token),
+  // so fail THIS job — never take the whole orchestrator down (getSecrets throws
+  // instead of process.exit now). No retry: retrying an auth gap just spins.
+  let secrets: Record<string, string>;
+  let isApiKeyFallback: boolean;
+  let source: string;
+  try {
+    ({ secrets, isApiKeyFallback, source } = await getSecrets());
+  } catch (err) {
+    const message = err instanceof AuthUnavailableError ? err.message : String(err);
+    console.error(`[Queue] Auth unavailable, failing job: ${message}`);
+    if (job.messageId) updateMessageStatus(job.messageId, "failed");
+    await deliver(channel, chatId, "I couldn't process that — authentication is temporarily unavailable.");
+    job.onError?.(message);
+    return;
+  }
+
+  const paths = ensureGroupFolder(group);
   const model = isApiKeyFallback ? "claude-sonnet-4-6" : job.model;
 
   // Load history before this run (user message already stored by caller)
@@ -125,31 +148,20 @@ async function executeJob(job: Job): Promise<void> {
 
   console.log(`[Queue] Running job for ${senderName} (group: ${group}, attempt: ${job.attempt}/${MAX_RETRIES})`);
 
+  // The container run and the reply delivery are separate failure domains. A send
+  // failure must never roll back or re-run the agent (duplicate work), so we only
+  // retry the *container* here; delivery has its own bounded retry in deliver().
+  let output;
   try {
-    const output = await runContainer(input, paths);
-
-    if (output.status === "success") {
-      const result = output.result ?? "(no response)";
-      if (job.messageId) updateMessageStatus(job.messageId, "done");
-      insertMessage(group, "assistant", result);
-      await channel.sendMessage(chatId, result);
-      job.onComplete?.(result);
-    } else {
-      // Agent-level error (not a container crash) — don't retry
-      if (job.messageId) updateMessageStatus(job.messageId, "failed");
-      const errMsg = `Error: ${output.error ?? "unknown error"}`;
-      console.error(`[Queue] Agent error: ${errMsg}`);
-      await channel.sendMessage(chatId, errMsg);
-      job.onError?.(errMsg);
-    }
+    output = await runContainer(input, paths);
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     console.error(`[Queue] Container error (attempt ${job.attempt}/${MAX_RETRIES}): ${errMsg}`);
 
-    // Don't retry auth failures
+    // Don't retry auth failures — they won't fix themselves on a retry.
     if (isAuthError(errMsg)) {
       if (job.messageId) updateMessageStatus(job.messageId, "failed");
-      await channel.sendMessage(chatId, `Authentication error: ${errMsg}`);
+      await deliver(channel, chatId, `Authentication error: ${errMsg}`);
       job.onError?.(errMsg);
       return;
     }
@@ -161,8 +173,50 @@ async function executeJob(job: Job): Promise<void> {
       enqueue({ ...job, attempt: job.attempt + 1 });
     } else {
       if (job.messageId) updateMessageStatus(job.messageId, "failed");
-      await channel.sendMessage(chatId, `Failed after ${MAX_RETRIES} attempts: ${errMsg}`);
+      await deliver(channel, chatId, `Failed after ${MAX_RETRIES} attempts: ${errMsg}`);
       job.onError?.(errMsg);
+    }
+    return;
+  }
+
+  // Container ran to completion — persist the result FIRST, then deliver. If
+  // delivery fails, the result is already stored and onComplete still fires.
+  if (output.status === "success") {
+    const result = output.result ?? "(no response)";
+    if (job.messageId) updateMessageStatus(job.messageId, "done");
+    insertMessage(group, "assistant", result);
+    await deliver(channel, chatId, result);
+    job.onComplete?.(result);
+  } else {
+    // Agent-level error (not a container crash) — don't retry
+    if (job.messageId) updateMessageStatus(job.messageId, "failed");
+    const errMsg = `Error: ${output.error ?? "unknown error"}`;
+    console.error(`[Queue] Agent error: ${errMsg}`);
+    await deliver(channel, chatId, errMsg);
+    job.onError?.(errMsg);
+  }
+}
+
+/**
+ * Send a message with bounded exponential backoff. Never throws and never
+ * re-runs the container — delivery is a separate failure domain from the agent
+ * run, so a transient channel failure (e.g. Telegram 429) can't duplicate work.
+ * The agent result is already persisted before this is called.
+ */
+async function deliver(channel: Channel, chatId: string, text: string): Promise<void> {
+  for (let attempt = 1; attempt <= DELIVERY_MAX_RETRIES; attempt++) {
+    try {
+      await channel.sendMessage(chatId, text);
+      return;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (attempt >= DELIVERY_MAX_RETRIES) {
+        console.error(`[Queue] Delivery to ${chatId} failed after ${DELIVERY_MAX_RETRIES} attempts: ${msg}`);
+        return; // Give up — result is persisted; do not rethrow (would reject the job promise).
+      }
+      const delay = DELIVERY_BASE_MS * Math.pow(2, attempt - 1);
+      console.warn(`[Queue] Delivery attempt ${attempt} to ${chatId} failed (${msg}); retrying in ${delay}ms`);
+      await sleep(delay);
     }
   }
 }

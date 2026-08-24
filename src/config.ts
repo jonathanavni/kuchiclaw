@@ -34,6 +34,11 @@ export const MAX_RETRIES = 3;
 /** Base delay for exponential backoff on retries (ms). Delay = BASE_RETRY_MS * 2^(attempt-1) */
 export const BASE_RETRY_MS = 2000;
 
+/** Delivery (channel send) is retried independently of the container run, so a
+ *  transient send failure (e.g. Telegram 429) never re-runs the agent. */
+export const DELIVERY_MAX_RETRIES = 3;
+export const DELIVERY_BASE_MS = 1000;
+
 /** Hard timeout for graceful shutdown — kill remaining containers after this (ms) */
 export const SHUTDOWN_TIMEOUT_MS = 60 * 1000;
 

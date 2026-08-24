@@ -21,6 +21,19 @@ function readTokenFromKeychain(): string | null {
 /** Which credential path won — callers gate lineage-specific behavior on this */
 export type AuthSource = "env-token" | "oauth-json" | "api-key" | "keychain";
 
+/**
+ * No usable credential was found. Thrown (never `process.exit`) so a transient
+ * auth gap fails the one job instead of taking down the long-running orchestrator
+ * — on the Cloudflare-blocked VPS a stale token with no fallback would otherwise
+ * crash-loop the whole process. [M12 P3]
+ */
+export class AuthUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AuthUnavailableError";
+  }
+}
+
 export interface AuthResult {
   secrets: Record<string, string>;
   /** True when using ANTHROPIC_API_KEY (paid) instead of OAuth (free with Claude Max) */
@@ -62,12 +75,10 @@ export async function getSecrets(): Promise<AuthResult> {
         secrets.CLAUDE_CODE_OAUTH_TOKEN = keychainToken;
         source = "keychain";
       } else {
-        console.error(
-          "Error: No auth token found.\n" +
-          "Set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY in your environment,\n" +
+        throw new AuthUnavailableError(
+          "No auth token found. Set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY, " +
           "provide data/oauth.json (OAuth refresh), or log in to Claude Code."
         );
-        process.exit(1);
       }
     }
   }

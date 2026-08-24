@@ -25,6 +25,10 @@ export interface OAuthData {
 /** Cached in memory to avoid re-reading file on every call */
 let cached: OAuthData | null = null;
 
+/** Single-flight guard: concurrent jobs needing a refresh share one request so
+ *  they can't clobber each other's token via racing writes. */
+let refreshInFlight: Promise<OAuthData | null> | null = null;
+
 function loadFromDisk(): OAuthData | null {
   try {
     if (!fs.existsSync(OAUTH_PATH)) return null;
@@ -83,8 +87,18 @@ export function getRefreshToken(): string | null {
   return cached?.refreshToken ?? null;
 }
 
-/** Persist new OAuth tokens from a container refresh — updates cache and disk. */
+/**
+ * Persist new OAuth tokens from a container refresh — updates cache and disk.
+ * Monotonic: ignores a write whose token expires no later than the one we
+ * already hold, so a slower container returning an older token can't clobber a
+ * newer one when two finish near-simultaneously.
+ */
 export function updateOAuthData(data: OAuthData): void {
+  if (!cached) cached = loadFromDisk();
+  if (cached && data.expiresAt <= cached.expiresAt) {
+    console.warn("[OAuth] Ignoring stale token write (not newer than current)");
+    return;
+  }
   cached = data;
   saveToDisk(data);
 }
@@ -102,16 +116,24 @@ export async function getOAuthToken(): Promise<string | null> {
     return cached.accessToken;
   }
 
-  // Needs refresh
-  console.log("[OAuth] Token expiring soon, refreshing...");
-  const refreshed = await refreshToken(cached.refreshToken);
-  if (!refreshed) {
-    cached = null;
-    return null;
+  // Needs refresh — single-flight so N concurrent jobs trigger ONE refresh and
+  // share its result, rather than each racing a write to oauth.json.
+  if (!refreshInFlight) {
+    const rt = cached.refreshToken;
+    refreshInFlight = (async () => {
+      console.log("[OAuth] Token expiring soon, refreshing...");
+      const refreshed = await refreshToken(rt);
+      if (refreshed) {
+        cached = refreshed;
+        saveToDisk(refreshed);
+        console.log("[OAuth] Token refreshed, expires at", new Date(refreshed.expiresAt).toISOString());
+      } else {
+        cached = null;
+      }
+      return refreshed;
+    })().finally(() => { refreshInFlight = null; });
   }
 
-  cached = refreshed;
-  saveToDisk(refreshed);
-  console.log("[OAuth] Token refreshed, expires at", new Date(refreshed.expiresAt).toISOString());
-  return refreshed.accessToken;
+  const refreshed = await refreshInFlight;
+  return refreshed?.accessToken ?? null;
 }
