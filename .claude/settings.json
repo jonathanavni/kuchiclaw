@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "deny": ["Bash(rm -rf /)", "Bash(rm -rf ~)", "Bash(rm -rf .git)"]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -x node_modules/.bin/prettier ] && node_modules/.bin/prettier --write \"$FILE_PATH\" 2>/dev/null; true"
+          }
+        ]
+      }
+    ]
+  }
+}

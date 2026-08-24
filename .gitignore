@@ -3,9 +3,25 @@ dist/
 data/
 .env
 container/node_modules/
-project-plan.md
 kickoff-prompt.md
-tasks/
 groups/*
 !groups/example/
 .DS_Store
+
+# Private instance data — public repo, but personal/operational content stays local.
+# See CLAUDE.md "Repository & Privacy Model". Framework + reusable workflow scaffolding
+# (.claude/commands, .claude/rules, .claude/settings.json, docs/handoff-pattern.md,
+# templates/, ARCHITECTURE.md, README.md, CLAUDE.md) remain public.
+
+# Personal working state (was project-plan.md + tasks/ before the PLAN.md migration)
+/PLAN.md
+/PLAN-archive.md
+/BACKLOG.md
+
+# Internal working docs: audits, plans, research — describe the live deployment. Folder
+# convention: anything new under docs/internal/ is auto-excluded (no per-file edits needed).
+docs/internal/
+
+# Agent memory and personal Claude Code settings
+.claude/memory/
+.claude/settings.local.json

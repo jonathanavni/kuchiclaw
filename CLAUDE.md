@@ -79,13 +79,29 @@ Working flow (Telegram): `npx tsx src/index.ts` (secrets loaded from `.env`) →
 - No dashboards or web UIs — Telegram is the interface
 - Tests via vitest (`npm test`). Test files colocated as `*.test.ts`. Use in-memory SQLite via `resetDb(new Database(":memory:"))` for DB tests.
 
-## Task Tracking
+## Workflow & Task Tracking
 
-- Plan in `project-plan.md` (gitignored, internal working doc — checklists, implementation order, in-progress decisions)
-- Build, then update `ARCHITECTURE.md` (public, polished) with the clean version once a phase or major decision is complete
-- Active tasks in `tasks/todo.md` with checkable items
-- Check in before starting implementation
-- Mark items complete as you go
+This project uses the **tinytandem** two-model workflow (Claude orchestrator + Codex adversary). See `docs/handoff-pattern.md` for the full pattern.
+
+- **Session loop:** `/start` (read state, propose priorities — read-only) at session start; `/wrapup` (persist state + decisions) at session end; `/review` (fresh-context QA reviewer that defaults to rejection) after a milestone. Enter plan mode for any non-trivial task.
+- **Planning docs:**
+  - `PLAN.md` — active work: Current State (session-by-session, kept lean) + cumulative **Decisions Log** ("X over Y because Z", never archived). Read at `/start`, updated at `/wrapup`.
+  - `PLAN-archive.md` — completed / no-longer-load-bearing detail (holds the original project-plan research + milestone + deployment record).
+  - `BACKLOG.md` — idea funnel: unscoped potential work; graduates into `PLAN.md` when prioritized.
+  - `ARCHITECTURE.md` — the polished public reference; update once a phase or major decision is complete.
+  - `docs/handoff-pattern.md` — the public reusable methodology; `docs/internal/` (gitignored) holds this operator's audits, plans, and research (e.g. the M12 `hardening-plan.md`).
+- **Memory:** `.claude/memory/` (indexed by `MEMORY.md`) holds standing decisions (`decisions_product.md`), `gotchas.md` (incl. the Codex dispatch invocation), and `conventions.md`. Portable — copy the folder to onboard another agent.
+- **Cross-model handoffs:** for high-risk surfaces (IPC authorization, container mounts, auth/OAuth/secrets, scheduler correctness) run the full plan → implement → review ladder in `docs/handoff-pattern.md` §4, with Codex implementing the bounded slice and Claude gating integration. Templates in `templates/`.
+- **Rules:** `.claude/rules/core.md` — code-quality, behavior, safety, and context-hygiene rules.
+- Check in before starting implementation; mark items complete as you go.
+
+## Repository & Privacy Model
+
+KuchiClaw is a **public** portfolio project (github.com/jonathanavni/kuchiclaw) — the framework is meant to be cloned and reused — **and** the owner runs a **private** personal instance. These two goals coexist by keeping the reusable framework public and all personal/operational content local. **Never commit personal, operational, or live-deployment-sensitive content to this public repo.**
+
+- **Public (committed):** framework source (`src/`, `container/`), `Dockerfile`, deploy scaffolding (`deploy/`, `kuchiclaw.service`), living-file *templates* (`SOUL.md`, `TOOLS.md`, `HEARTBEAT.md`, `groups/example/`), polished docs (`ARCHITECTURE.md`, `README.md`, `CLAUDE.md`), and the reusable workflow scaffolding (`.claude/commands/`, `.claude/rules/`, `.claude/settings.json`, `docs/handoff-pattern.md`, `templates/`).
+- **Private (gitignored, never published):** secrets (`.env`, `data/`), agent memory (`groups/`, `.claude/memory/`), personal working state (`PLAN.md`, `PLAN-archive.md`, `BACKLOG.md`), internal working docs (`docs/internal/` — audits, plans, research), and personal Claude Code settings (`.claude/settings.local.json`).
+- **Two hard rules:** (1) security-audit findings about the live deployment must never be committed while the deployment is live/unfixed — they're an attack roadmap; (2) anything under `docs/internal/` is auto-excluded by the folder gitignore, so **new audits/plans/research go there** — don't scatter them into `docs/` root. Mirrors the long-standing `groups/example/` (public) vs `groups/` (private) pattern.
 
 ## Security Model
 
