@@ -44,7 +44,19 @@ export const IPC_DIR = path.join(DATA_DIR, "ipc");
 export const IPC_POLL_MS = 1000;
 
 /** Directory for failed IPC requests */
-export const IPC_ERRORS_DIR = path.join(IPC_DIR, "errors");
+export const IPC_ERRORS_DIR = path.join(DATA_DIR, "ipc-errors");
+
+/** Filesystem half of the IPC layout attestation; containers never mount this path. */
+export const IPC_LAYOUT_MARKER = path.join(DATA_DIR, "ipc-layout-v2");
+
+/** Maximum accepted IPC request size, excluding the one-byte overflow probe. */
+export const MAX_REQUEST_BYTES = 64 * 1024;
+
+/** Maximum directory entries considered per namespace during one poll cycle. */
+export const MAX_REQUESTS_PER_NAMESPACE = 64;
+
+/** Grace period for a writer to atomically finish and rename an IPC request. */
+export const IPC_PARSE_GRACE_MS = 10_000;
 
 /** Skills directory — CLI scripts/API wrappers mounted into containers */
 export const SKILLS_DIR = path.join(PROJECT_ROOT, "skills");

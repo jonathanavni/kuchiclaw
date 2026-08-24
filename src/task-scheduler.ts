@@ -7,6 +7,7 @@ import { CronExpressionParser } from "cron-parser";
 import { SCHEDULER_POLL_MS } from "./config.js";
 import { getDueTasks, updateTaskNextRun, updateTaskStatus, insertTaskRunLog } from "./db.js";
 import { enqueue } from "./group-queue.js";
+import { assertDestinationAllowed } from "./ipc-auth.js";
 import type { Channel } from "./channels/registry.js";
 import type { McpServerConfig, ScheduledTask } from "./types.js";
 
@@ -52,6 +53,16 @@ function poll(): void {
   const dueTasks = getDueTasks(now);
 
   for (const task of dueTasks) {
+    try {
+      assertDestinationAllowed(task.group_folder, task.group_folder === "main", task.chat_id);
+    } catch (err) {
+      console.error(
+        `[Scheduler] REFUSING task ${task.id} with invalid destination identity: ${err}`,
+      );
+      updateTaskStatus(task.id, "paused");
+      continue;
+    }
+
     if (inFlight.has(task.id)) {
       console.log(`[Scheduler] Task ${task.id} (${task.label ?? "unlabeled"}) still in flight, skipping`);
       continue;

@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import Database from "better-sqlite3";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   resetDb,
   getDb,
@@ -13,11 +16,39 @@ import {
   updateTaskStatus,
   updateTaskNextRun,
   insertTaskRunLog,
+  initializeIpcLayoutEpoch,
+  inspectDbAttestation,
 } from "./db.js";
 
 // Each test gets a fresh in-memory DB with schema applied
 beforeEach(() => {
   resetDb(new Database(":memory:"));
+});
+
+describe("IPC layout database epoch", () => {
+  it("initializes user_version 2 on a fresh database", () => {
+    initializeIpcLayoutEpoch();
+    expect(getDb().pragma("user_version", { simple: true })).toBe(2);
+  });
+
+  it("reads the epoch and legacy task count without schema initialization", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "kuchiclaw-db-state-"));
+    const databasePath = path.join(directory, "state.db");
+    const database = new Database(databasePath);
+    database.exec(`
+      CREATE TABLE scheduled_tasks (id INTEGER PRIMARY KEY);
+      INSERT INTO scheduled_tasks DEFAULT VALUES;
+      PRAGMA user_version = 1;
+    `);
+    database.close();
+
+    expect(inspectDbAttestation(databasePath)).toEqual({
+      exists: true,
+      userVersion: 1,
+      scheduledTaskCount: 1,
+    });
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
 });
 
 describe("scheduled_tasks CRUD", () => {

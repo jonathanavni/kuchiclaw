@@ -8,6 +8,7 @@ import { getSecrets } from "./auth.js";
 import { getRefreshToken } from "./oauth-refresh.js";
 import { insertMessage, getRecentMessages, formatHistory, updateMessageStatus } from "./db.js";
 import { MAX_CONTAINERS_PER_GROUP, MAX_RETRIES, BASE_RETRY_MS } from "./config.js";
+import { assertDestinationAllowed } from "./ipc-auth.js";
 import type { ContainerInput, McpServerConfig } from "./types.js";
 import type { Channel } from "./channels/registry.js";
 
@@ -72,8 +73,6 @@ function drain(group: string): void {
   const job = queue.shift()!;
   running.set(group, count + 1);
 
-  if (job.messageId) updateMessageStatus(job.messageId, "processing");
-
   const promise = executeJob(job).finally(() => {
     activeJobs.delete(promise);
     running.set(group, (running.get(group) ?? 1) - 1);
@@ -86,6 +85,18 @@ function drain(group: string): void {
 /** Execute a single job: run container, store result, send response. Retry on failure. */
 async function executeJob(job: Job): Promise<void> {
   const { group, chatId, senderName, text, channel } = job;
+
+  try {
+    assertDestinationAllowed(group, group === "main", chatId);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[Queue] Invalid job identity: ${message}`);
+    if (job.messageId) updateMessageStatus(job.messageId, "failed");
+    job.onError?.(message);
+    return;
+  }
+
+  if (job.messageId) updateMessageStatus(job.messageId, "processing");
   const paths = ensureGroupFolder(group);
 
   // Refresh auth on every job — tokens expire and the process is long-lived

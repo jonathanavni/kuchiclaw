@@ -44,13 +44,12 @@ describe("groupToChatId", () => {
     expect(groupToChatId("tg--1001234567")).toBe("-1001234567");
   });
 
-  it("handles different channel prefixes", () => {
-    expect(groupToChatId("wa-15551234567")).toBe("15551234567");
+  it("rejects non-Telegram channel prefixes", () => {
+    expect(groupToChatId("wa-15551234567")).toBeNull();
   });
 
   it("returns null for unrecognized group names", () => {
     expect(groupToChatId("UPPERCASE-123")).toBeNull();
-    // "no" is treated as a valid lowercase prefix, rest is the chatId
-    expect(groupToChatId("no-prefix-match-123")).toBe("prefix-match-123");
+    expect(groupToChatId("no-prefix-match-123")).toBeNull();
   });
 });

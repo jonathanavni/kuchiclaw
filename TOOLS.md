@@ -18,38 +18,41 @@ Tools available to you inside the container.
 
 ## IPC (Inter-Process Communication)
 
-You can send messages to any chat by writing a JSON file to `/workspace/ipc/`. The host polls this directory and executes valid requests.
+You can request messages and scheduled-task operations by atomically placing JSON files in `/workspace/ipc/`. The host derives your identity from this mounted directory; requests do not supply a group.
 
 **Send a message:**
 ```bash
-cat > /workspace/ipc/msg-$(date +%s%N).json << 'EOF'
+tmp=/workspace/ipc/msg-$(date +%s%N).tmp
+cat > "$tmp" << 'EOF'
 {
   "op": "message",
   "chatId": "<target chat ID>",
-  "text": "Hello from the agent!",
-  "group": "<your group name>"
+  "text": "Hello from the agent!"
 }
 EOF
+mv "$tmp" "${tmp%.tmp}.json"
 ```
 
 - Use unique filenames (timestamp-based) to avoid collisions
-- The file is deleted after processing; failed requests are moved to `ipc/errors/`
-- Your group name and chat ID are in the **Session Context** section of your system prompt — use them for the `group` and `chatId` fields
+- Always write a `.tmp` file completely and then rename it to `.json`; the host ignores non-JSON files
+- The file is deleted after processing; failed requests are quarantined by the host
+- Your chat ID is in the **Session Context** section of your system prompt
 - **Scoping:** Non-main groups can only message their own chat and manage their own tasks. The `main` group has full access to all chats and tasks.
 
 **Create a scheduled task:**
 ```bash
-cat > /workspace/ipc/task-$(date +%s%N).json << 'EOF'
+tmp=/workspace/ipc/task-$(date +%s%N).tmp
+cat > "$tmp" << 'EOF'
 {
   "op": "task_create",
   "chatId": "<target chat ID>",
-  "group": "<your group name>",
   "prompt": "Check my inbox and summarize unread emails",
   "scheduleType": "cron",
   "scheduleValue": "0 8 * * *",
   "label": "morning briefing"
 }
 EOF
+mv "$tmp" "${tmp%.tmp}.json"
 ```
 
 Schedule types:
@@ -59,26 +62,28 @@ Schedule types:
 
 **Pause/resume/cancel a task:**
 ```bash
-cat > /workspace/ipc/task-$(date +%s%N).json << 'EOF'
+tmp=/workspace/ipc/task-$(date +%s%N).tmp
+cat > "$tmp" << 'EOF'
 {
   "op": "task_pause",
   "chatId": "<target chat ID>",
-  "group": "<your group name>",
   "taskId": 1
 }
 EOF
+mv "$tmp" "${tmp%.tmp}.json"
 ```
 Replace `task_pause` with `task_resume` or `task_cancel` as needed.
 
 **List scheduled tasks:**
 ```bash
-cat > /workspace/ipc/task-$(date +%s%N).json << 'EOF'
+tmp=/workspace/ipc/task-$(date +%s%N).tmp
+cat > "$tmp" << 'EOF'
 {
   "op": "task_list",
-  "chatId": "<target chat ID>",
-  "group": "<your group name>"
+  "chatId": "<target chat ID>"
 }
 EOF
+mv "$tmp" "${tmp%.tmp}.json"
 ```
 
 ## Skills

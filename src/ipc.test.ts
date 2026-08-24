@@ -1,10 +1,8 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
-import { resetDb, insertTask } from "./db.js";
+import { getTasksByGroup, insertTask, resetDb } from "./db.js";
 import { execute, registerSender } from "./ipc.js";
-import type { IpcRequest } from "./types.js";
 
-// Mock config — MAIN_CHAT_ID is channel-qualified
 vi.mock("./config.js", async () => {
   const actual = await vi.importActual<typeof import("./config.js")>("./config.js");
   return { ...actual, MAIN_CHAT_ID: "tg-999" };
@@ -12,93 +10,81 @@ vi.mock("./config.js", async () => {
 
 beforeEach(() => {
   resetDb(new Database(":memory:"));
+  registerSender(async () => {});
 });
 
-describe("IPC authorization", () => {
-  it("allows main group to message any chat", async () => {
-    const sent: string[] = [];
-    registerSender(async (_chatId, text) => { sent.push(text); });
-
-    await execute({
-      op: "message",
-      chatId: "someone-else",
-      group: "main",
-      text: "hello from admin",
-    });
-
-    expect(sent).toContain("hello from admin");
-  });
-
-  it("allows non-main group to message its own chat", async () => {
-    const sent: { chatId: string; text: string }[] = [];
-    registerSender(async (chatId, text) => { sent.push({ chatId, text }); });
-
-    await execute({
-      op: "message",
-      chatId: "123",
-      group: "tg-123",
-      text: "hello from my group",
-    });
-
-    expect(sent).toHaveLength(1);
-    expect(sent[0].text).toBe("hello from my group");
-  });
-
-  it("blocks non-main group from messaging a different chat", async () => {
-    registerSender(async () => {});
-
+describe("IPC mount-derived authorization", () => {
+  it("ignores a forged payload group and blocks the foreign destination", async () => {
     await expect(execute({
       op: "message",
-      chatId: "456",
-      group: "tg-123",
-      text: "trying to reach another chat",
-    })).rejects.toThrow(/Authorization denied/);
-  });
-
-  it("blocks non-main group from modifying another group's task", async () => {
-    registerSender(async () => {});
-
-    // Create a task belonging to "main"
-    const taskId = insertTask("main", "999", "main's task", "once", "2099-01-01T00:00:00Z", "2099-01-01T00:00:00Z");
-
-    await expect(execute({
-      op: "task_cancel",
-      chatId: "123",
-      group: "tg-123",
-      taskId,
-    })).rejects.toThrow(/Authorization denied/);
-  });
-
-  it("allows non-main group to manage its own tasks", async () => {
-    const sent: string[] = [];
-    registerSender(async (_chatId, text) => { sent.push(text); });
-
-    // Create a task belonging to "tg-123"
-    const taskId = insertTask("tg-123", "123", "my task", "once", "2099-01-01T00:00:00Z", "2099-01-01T00:00:00Z");
-
-    await execute({
-      op: "task_cancel",
-      chatId: "123",
-      group: "tg-123",
-      taskId,
-    });
-
-    expect(sent.some((s) => s.includes("completed"))).toBe(true);
-  });
-
-  it("allows main group to manage any group's tasks", async () => {
-    const sent: string[] = [];
-    registerSender(async (_chatId, text) => { sent.push(text); });
-
-    const taskId = insertTask("tg-123", "123", "someone's task", "once", "2099-01-01T00:00:00Z", "2099-01-01T00:00:00Z");
-
-    await execute({
-      op: "task_cancel",
       chatId: "999",
       group: "main",
-      taskId,
-    });
+      text: "claimed admin",
+    }, "tg-123", false)).rejects.toThrow(/Authorization denied/);
+  });
 
-    expect(sent.some((s) => s.includes("completed"))).toBe(true);
+  it("uses the source namespace even when the payload claims main", async () => {
+    const sent: Array<{ chatId: string; text: string }> = [];
+    registerSender(async (chatId, text) => { sent.push({ chatId, text }); });
+    await execute({
+      op: "message",
+      chatId: "123",
+      group: "main",
+      text: "own chat",
+    }, "tg-123", false);
+    expect(sent).toEqual([{ chatId: "123", text: "own chat" }]);
+  });
+
+  it("allows main to message any canonical chat", async () => {
+    const sent: string[] = [];
+    registerSender(async (chatId) => { sent.push(chatId); });
+    await execute({ op: "message", chatId: "123", text: "admin" }, "main", true);
+    expect(sent).toEqual(["123"]);
+  });
+
+  it.each(["456", "01"])(
+    "rejects task creation for unauthorized or noncanonical chat %s",
+    async (chatId) => {
+      await expect(execute({
+        op: "task_create",
+        chatId,
+        prompt: "bad task",
+        scheduleType: "once",
+        scheduleValue: "2099-01-01T00:00:00Z",
+      }, "tg-123", false)).rejects.toThrow(/Authorization denied/);
+      expect(getTasksByGroup("tg-123")).toHaveLength(0);
+    },
+  );
+
+  it("persists task identity from the source namespace", async () => {
+    await execute({
+      op: "task_create",
+      chatId: "123",
+      group: "main",
+      prompt: "valid task",
+      scheduleType: "once",
+      scheduleValue: "2099-01-01T00:00:00Z",
+    }, "tg-123", false);
+    expect(getTasksByGroup("tg-123")).toHaveLength(1);
+    expect(getTasksByGroup("main")).toHaveLength(0);
+  });
+
+  it("never lists another group's tasks based on the payload echo", async () => {
+    insertTask("main", "999", "private", "once", "2099-01-01T00:00:00Z", "2099-01-01T00:00:00Z", "private");
+    insertTask("tg-123", "123", "own", "once", "2099-01-01T00:00:00Z", "2099-01-01T00:00:00Z", "own");
+    const replies: string[] = [];
+    registerSender(async (_chatId, text) => { replies.push(text); });
+    await execute({ op: "task_list", chatId: "123", group: "main" }, "tg-123", false);
+    expect(replies[0]).toContain("own");
+    expect(replies[0]).not.toContain("private");
+  });
+
+  it("blocks non-main task mutation across namespaces", async () => {
+    const taskId = insertTask("main", "999", "private", "once", "2099-01-01T00:00:00Z", "2099-01-01T00:00:00Z");
+    await expect(execute({
+      op: "task_cancel",
+      chatId: "123",
+      taskId,
+    }, "tg-123", false)).rejects.toThrow(/cannot modify task/);
   });
 });

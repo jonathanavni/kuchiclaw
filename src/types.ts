@@ -36,8 +36,8 @@ export interface IpcRequest {
   chatId: string;
   /** Message text (for "message" op) */
   text?: string;
-  /** Group that originated this request (for authorization) */
-  group: string;
+  /** Optional debug echo; authorization derives from the mounted namespace. */
+  group?: string;
 
   // Task fields (for task_* ops)
   /** Task prompt — what the agent should do when the task runs */

@@ -7,7 +7,8 @@ import fs from "node:fs";
 import { DATA_DIR } from "./config.js";
 import type { ScheduledTask, TaskRunLog } from "./types.js";
 
-const DB_PATH = path.join(DATA_DIR, "kuchiclaw.db");
+export const DB_PATH = path.join(DATA_DIR, "kuchiclaw.db");
+export const IPC_LAYOUT_DB_VERSION = 2;
 
 export type ProcessingStatus = "pending" | "processing" | "done" | "failed";
 
@@ -48,6 +49,41 @@ export function getDb(): Database.Database {
   initSchema(db);
 
   return db;
+}
+
+export interface DbAttestation {
+  exists: boolean;
+  userVersion: number;
+  scheduledTaskCount: number;
+}
+
+/** Read the cutover state without running schema creation or migrations. */
+export function inspectDbAttestation(databasePath = DB_PATH): DbAttestation {
+  if (!fs.existsSync(databasePath)) {
+    return { exists: false, userVersion: 0, scheduledTaskCount: 0 };
+  }
+
+  const database = new Database(databasePath, { readonly: true, fileMustExist: true });
+  try {
+    const userVersion = database.pragma("user_version", { simple: true }) as number;
+    const table = database.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'scheduled_tasks'",
+    ).get();
+    const scheduledTaskCount = table
+      ? (database.prepare("SELECT COUNT(*) AS count FROM scheduled_tasks").get() as { count: number }).count
+      : 0;
+    return { exists: true, userVersion, scheduledTaskCount };
+  } finally {
+    database.close();
+  }
+}
+
+/** Stamp a fresh database only after startup has proved there is no legacy state. */
+export function initializeIpcLayoutEpoch(): void {
+  const database = getDb();
+  database.transaction(() => {
+    database.pragma(`user_version = ${IPC_LAYOUT_DB_VERSION}`);
+  })();
 }
 
 function initSchema(database: Database.Database): void {

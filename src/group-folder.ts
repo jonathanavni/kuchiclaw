@@ -4,6 +4,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { GROUPS_DIR, PROJECT_ROOT, IPC_DIR, SKILLS_DIR } from "./config.js";
+import { isValidGroupName } from "./ipc-auth.js";
 
 export interface GroupPaths {
   /** Root of this group's folder (e.g., groups/main/) */
@@ -28,7 +29,12 @@ export interface GroupPaths {
 
 /** Ensure a group folder exists with all required files, return paths. */
 export function ensureGroupFolder(groupName: string): GroupPaths {
+  if (!isValidGroupName(groupName)) {
+    throw new Error(`Invalid group name: "${groupName}"`);
+  }
+
   const root = path.join(GROUPS_DIR, groupName);
+  const ipc = path.join(IPC_DIR, groupName);
   const paths: GroupPaths = {
     root,
     memory: path.join(root, "MEMORY.md"),
@@ -36,16 +42,18 @@ export function ensureGroupFolder(groupName: string): GroupPaths {
     logs: path.join(root, "logs"),
     soul: path.join(PROJECT_ROOT, "SOUL.md"),
     tools: path.join(PROJECT_ROOT, "TOOLS.md"),
-    ipc: IPC_DIR,
+    ipc,
     skills: SKILLS_DIR,
     heartbeat: path.join(PROJECT_ROOT, "HEARTBEAT.md"),
   };
 
-  // Create group directory and logs/
-  fs.mkdirSync(paths.logs, { recursive: true });
+  assertRealDirectoryIfPresent(root, "group");
+  assertRealDirectoryIfPresent(ipc, "IPC namespace");
 
-  // Ensure IPC directory exists
-  fs.mkdirSync(IPC_DIR, { recursive: true });
+  fs.mkdirSync(paths.logs, { recursive: true });
+  fs.mkdirSync(ipc, { recursive: true });
+  assertRealDirectoryIfPresent(root, "group");
+  assertRealDirectoryIfPresent(ipc, "IPC namespace");
 
   // Seed MEMORY.md if it doesn't exist
   if (!fs.existsSync(paths.memory)) {
@@ -58,4 +66,15 @@ export function ensureGroupFolder(groupName: string): GroupPaths {
   }
 
   return paths;
+}
+
+function assertRealDirectoryIfPresent(target: string, description: string): void {
+  try {
+    const stat = fs.lstatSync(target);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error(`${description} path is not a real directory: ${target}`);
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
 }

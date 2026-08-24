@@ -27,7 +27,6 @@ export function groupToChatId(group: string): string | null {
     return match ? match[1] : null;
   }
 
-  // Strip "{prefix}-" — the prefix is any sequence of lowercase letters
-  const match = group.match(/^[a-z]+-(.+)$/);
+  const match = group.match(/^tg-(.+)$/);
   return match ? match[1] : null;
 }

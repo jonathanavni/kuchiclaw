@@ -6,15 +6,117 @@
 
 import "dotenv/config";
 import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { TelegramChannel } from "./channels/telegram.js";
 import { getSecrets } from "./auth.js";
-import { insertMessage, getOrphanedMessages, updateMessageStatus } from "./db.js";
+import {
+  initializeIpcLayoutEpoch,
+  insertMessage,
+  getOrphanedMessages,
+  inspectDbAttestation,
+  IPC_LAYOUT_DB_VERSION,
+  updateMessageStatus,
+  type DbAttestation,
+} from "./db.js";
 import { enqueue, shutdown as shutdownQueue } from "./group-queue.js";
-import { registerSender, startPolling, stopPolling } from "./ipc.js";
+import {
+  quarantineLooseRootRequests,
+  registerSender,
+  startPolling,
+  stopPolling,
+} from "./ipc.js";
 import { startScheduler, stopScheduler } from "./task-scheduler.js";
 import { chatIdToGroup, groupToChatId } from "./group-mapping.js";
-import { SHUTDOWN_TIMEOUT_MS, MCP_SERVERS_PATH } from "./config.js";
+import {
+  ALLOWED_SENDER_IDS,
+  IPC_DIR,
+  IPC_LAYOUT_MARKER,
+  MAIN_CHAT_ID,
+  SHUTDOWN_TIMEOUT_MS,
+  MCP_SERVERS_PATH,
+} from "./config.js";
+import {
+  assertDestinationAllowed,
+  isValidMainChatId,
+} from "./ipc-auth.js";
+import type { Channel } from "./channels/registry.js";
 import type { McpServerConfig } from "./types.js";
+
+const CUTOVER_INSTRUCTION = "run deploy/cutover-m12-p1.sh before starting KuchiClaw";
+
+export interface StartupGateOptions {
+  mainChatId?: string;
+  allowedSenderIds?: string[];
+  ipcDir?: string;
+  markerPath?: string;
+  inspectDb?: () => DbAttestation;
+  initializeEpoch?: () => void;
+}
+
+/** Validate both cutover factors before any orchestrator side effect. */
+export function enforceStartupGate(options: StartupGateOptions = {}): void {
+  const mainChatId = options.mainChatId ?? MAIN_CHAT_ID;
+  const allowedSenderIds = options.allowedSenderIds ?? ALLOWED_SENDER_IDS;
+  const ipcDir = options.ipcDir ?? IPC_DIR;
+  const markerPath = options.markerPath ?? IPC_LAYOUT_MARKER;
+  const inspectDb = options.inspectDb ?? inspectDbAttestation;
+  const initializeEpoch = options.initializeEpoch ?? initializeIpcLayoutEpoch;
+
+  if (mainChatId && !isValidMainChatId(mainChatId)) {
+    throw new Error(`Invalid MAIN_CHAT_ID "${mainChatId}"; expected tg-<canonicalChatId>`);
+  }
+
+  const markerPresent = hasValidMarker(markerPath);
+  const dbState = inspectDb();
+  if (markerPresent) {
+    if (!dbState.exists || dbState.userVersion !== IPC_LAYOUT_DB_VERSION) {
+      throw new Error(`IPC cutover attestation mismatch; ${CUTOVER_INSTRUCTION}`);
+    }
+  } else {
+    const freshDb = !dbState.exists || dbState.scheduledTaskCount === 0;
+    if (!freshDb || !isAbsentOrEmptyDirectory(ipcDir)) {
+      throw new Error(`IPC cutover attestation missing; ${CUTOVER_INSTRUCTION}`);
+    }
+    initializeEpoch();
+    fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+    const fd = fs.openSync(
+      markerPath,
+      fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
+      0o600,
+    );
+    fs.closeSync(fd);
+  }
+
+  if (allowedSenderIds.length === 0) {
+    console.warn(
+      "[SECURITY] WARNING: ALLOWED_SENDER_IDS is empty; any Telegram user who can reach the bot is allowed.",
+    );
+  }
+}
+
+function hasValidMarker(markerPath: string): boolean {
+  try {
+    const stat = fs.lstatSync(markerPath);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new Error(`Invalid IPC layout marker; ${CUTOVER_INSTRUCTION}`);
+    }
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+}
+
+function isAbsentOrEmptyDirectory(directory: string): boolean {
+  try {
+    const stat = fs.lstatSync(directory);
+    return stat.isDirectory() && !stat.isSymbolicLink() && fs.readdirSync(directory).length === 0;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return true;
+    throw err;
+  }
+}
 
 /** Load MCP server configs from mcp-servers.json (if it exists) */
 function loadMcpServers(): Record<string, McpServerConfig> | undefined {
@@ -33,7 +135,10 @@ function loadMcpServers(): Record<string, McpServerConfig> | undefined {
   return undefined;
 }
 
-async function main(): Promise<void> {
+export async function main(startupOptions: StartupGateOptions = {}): Promise<void> {
+  enforceStartupGate(startupOptions);
+  quarantineLooseRootRequests();
+
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   if (!botToken) {
     console.error("Error: TELEGRAM_BOT_TOKEN environment variable is required.");
@@ -53,6 +158,12 @@ async function main(): Promise<void> {
 
   channel.onMessage((msg) => {
     const group = chatIdToGroup("tg", msg.chatId);
+    try {
+      assertDestinationAllowed(group, group === "main", msg.chatId);
+    } catch (err) {
+      console.error(`[Orchestrator] Refusing message with invalid identity: ${err}`);
+      return;
+    }
 
     // Log first message from a new group
     if (!knownGroups.has(group)) {
@@ -85,33 +196,7 @@ async function main(): Promise<void> {
     });
   });
 
-  // Crash recovery: re-enqueue messages that were in-flight when we last stopped
-  const orphans = getOrphanedMessages();
-  if (orphans.length > 0) {
-    console.log(`[Recovery] Found ${orphans.length} orphaned message(s) — re-enqueueing`);
-    for (const msg of orphans) {
-      const chatId = msg.chat_id ?? groupToChatId(msg.group_folder);
-      if (!chatId) {
-        console.warn(`[Recovery] Skipping message ${msg.id}: cannot resolve chatId for group ${msg.group_folder}`);
-        updateMessageStatus(msg.id, "failed");
-        continue;
-      }
-      console.log(`[Recovery] Re-enqueueing message ${msg.id} (group: ${msg.group_folder}): "${msg.content.slice(0, 60)}..."`);
-      updateMessageStatus(msg.id, "pending");
-      enqueue({
-        group: msg.group_folder,
-        chatId,
-        senderName: msg.sender_name ?? "Unknown",
-        text: msg.content,
-        secrets,
-        channel,
-        mcpServers,
-        model,
-        attempt: 1,
-        messageId: msg.id,
-      });
-    }
-  }
+  recoverOrphanedMessages({ secrets, channel, mcpServers, model });
 
   await channel.connect();
   startPolling();
@@ -148,4 +233,55 @@ async function main(): Promise<void> {
   process.on("SIGTERM", shutdown);
 }
 
-main();
+interface RecoveryOptions {
+  secrets: Record<string, string>;
+  channel: Channel;
+  mcpServers?: Record<string, McpServerConfig>;
+  model?: string;
+}
+
+export function recoverOrphanedMessages(options: RecoveryOptions): void {
+  const orphans = getOrphanedMessages();
+  if (orphans.length > 0) {
+    console.log(`[Recovery] Found ${orphans.length} orphaned message(s) — re-enqueueing`);
+    for (const msg of orphans) {
+      const chatId = msg.chat_id ?? groupToChatId(msg.group_folder);
+      try {
+        if (!chatId) throw new Error("chat ID cannot be resolved");
+        assertDestinationAllowed(
+          msg.group_folder,
+          msg.group_folder === "main",
+          chatId,
+        );
+      } catch (err) {
+        console.error(
+          `[Recovery] REFUSING message ${msg.id} with invalid destination identity: ${err}`,
+        );
+        updateMessageStatus(msg.id, "failed");
+        continue;
+      }
+      console.log(`[Recovery] Re-enqueueing message ${msg.id} (group: ${msg.group_folder}): "${msg.content.slice(0, 60)}..."`);
+      updateMessageStatus(msg.id, "pending");
+      enqueue({
+        group: msg.group_folder,
+        chatId,
+        senderName: msg.sender_name ?? "Unknown",
+        text: msg.content,
+        secrets: options.secrets,
+        channel: options.channel,
+        mcpServers: options.mcpServers,
+        model: options.model,
+        attempt: 1,
+        messageId: msg.id,
+      });
+    }
+  }
+
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((err) => {
+    console.error(`[Orchestrator] Startup failed: ${err instanceof Error ? err.message : err}`);
+    process.exit(1);
+  });
+}

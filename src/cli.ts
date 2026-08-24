@@ -5,10 +5,13 @@
 //    or: npx tsx src/cli.ts "What is 2+2?"
 
 import "dotenv/config";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { runContainer } from "./container-runner.js";
 import { ensureGroupFolder } from "./group-folder.js";
 import { insertMessage, getRecentMessages, formatHistory } from "./db.js";
 import { getSecrets } from "./auth.js";
+import { isValidGroupName } from "./ipc-auth.js";
 import type { ContainerInput } from "./types.js";
 
 async function readStdin(): Promise<string> {
@@ -42,8 +45,17 @@ function parseArgs(argv: string[]): { group: string; showHistory: boolean; promp
   return { group, showHistory, promptArgs };
 }
 
-async function main() {
+export function validateCliGroup(group: string): void {
+  if (isValidGroupName(group)) return;
+  if (group === "main") {
+    throw new Error('Group "main" is unavailable: set MAIN_CHAT_ID or pass --group tg-<id>');
+  }
+  throw new Error(`Invalid group name "${group}"; pass --group tg-<id>`);
+}
+
+export async function main() {
   const { group, showHistory, promptArgs } = parseArgs(process.argv);
+  validateCliGroup(group);
 
   // --history: display recent conversation and exit
   if (showHistory) {
@@ -108,4 +120,9 @@ async function main() {
   }
 }
 
-main();
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((err) => {
+    console.error(`[KuchiClaw] ${err instanceof Error ? err.message : err}`);
+    process.exit(1);
+  });
+}
