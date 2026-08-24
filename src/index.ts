@@ -55,6 +55,8 @@ export interface StartupGateOptions {
   initializeEpoch?: () => void;
   /** Tests skip the crash-loop backoff (which would otherwise read/write real breaker state). */
   skipBackoff?: boolean;
+  /** Override the breaker state-file path so tests never touch the real data/ file. */
+  cbPath?: string;
 }
 
 /** Validate both cutover factors before any orchestrator side effect. */
@@ -141,7 +143,9 @@ export async function main(startupOptions: StartupGateOptions = {}): Promise<voi
   // Back off inside the process when crash-looping, so systemd's StartLimit
   // never trips the unit into a permanent `failed` state. First thing we do —
   // it only touches its own state file. Skippable in tests via startupOptions.
-  if (startupOptions.skipBackoff !== true) await enforceStartupBackoff();
+  if (startupOptions.skipBackoff !== true) {
+    await enforceStartupBackoff(startupOptions.cbPath ? { cbPath: startupOptions.cbPath } : {});
+  }
 
   enforceStartupGate(startupOptions);
   quarantineLooseRootRequests();

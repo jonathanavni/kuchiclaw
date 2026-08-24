@@ -183,8 +183,12 @@ async function executeJob(job: Job): Promise<void> {
   // delivery fails, the result is already stored and onComplete still fires.
   if (output.status === "success") {
     const result = output.result ?? "(no response)";
-    if (job.messageId) updateMessageStatus(job.messageId, "done");
+    // Persist the result BEFORE marking the user message done. If we marked done
+    // first and crashed before the insert, recovery would skip a message that has
+    // no stored reply (a silent drop). This order downgrades that to at worst a
+    // re-run (duplicate reply) on crash — strictly safer.
     insertMessage(group, "assistant", result);
+    if (job.messageId) updateMessageStatus(job.messageId, "done");
     await deliver(channel, chatId, result);
     job.onComplete?.(result);
   } else {
@@ -202,6 +206,10 @@ async function executeJob(job: Job): Promise<void> {
  * re-runs the container — delivery is a separate failure domain from the agent
  * run, so a transient channel failure (e.g. Telegram 429) can't duplicate work.
  * The agent result is already persisted before this is called.
+ *
+ * Retry is not idempotent: a send that Telegram accepted but whose ack was lost
+ * (network timeout after delivery) will be resent, so a rare duplicate message is
+ * possible. Accepted — a duplicate reply beats a dropped one for this use case.
  */
 async function deliver(channel: Channel, chatId: string, text: string): Promise<void> {
   for (let attempt = 1; attempt <= DELIVERY_MAX_RETRIES; attempt++) {

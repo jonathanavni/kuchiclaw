@@ -49,6 +49,7 @@ describe("startup gate ordering", () => {
     await expect(main({
       ipcDir,
       markerPath: path.join(root, "ipc-layout-v2"),
+      cbPath: path.join(root, "circuit-breaker.json"), // isolate breaker state from real data/
       inspectDb: () => ({ exists: true, userVersion: 1, scheduledTaskCount: 1 }),
       initializeEpoch: vi.fn(),
     })).rejects.toThrow(/cutover/);

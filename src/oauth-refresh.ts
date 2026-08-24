@@ -92,6 +92,14 @@ export function getRefreshToken(): string | null {
  * Monotonic: ignores a write whose token expires no later than the one we
  * already hold, so a slower container returning an older token can't clobber a
  * newer one when two finish near-simultaneously.
+ *
+ * Ordering by access-token expiry is a heuristic, not a true refresh-lineage
+ * sequence — it can't perfectly resolve a rotated refresh token. On the actual
+ * VPS this is low-risk: the host is Cloudflare-blocked from platform.claude.com,
+ * so host-side refresh never runs there and the container is the sole refresher;
+ * and the P4.1 primary path (a dedicated setup-token grant) passes no refresh
+ * token to containers at all, so no container refresh happens. The full
+ * compare-and-swap/generation fix is deferred as disproportionate here.
  */
 export function updateOAuthData(data: OAuthData): void {
   if (!cached) cached = loadFromDisk();

@@ -28,7 +28,15 @@ vi.mock("./auth.js", async () => {
 import { runContainer } from "./container-runner.js";
 import { getSecrets, AuthUnavailableError } from "./auth.js";
 import { updateMessageStatus, insertMessage } from "./db.js";
+import { assertDestinationAllowed } from "./ipc-auth.js";
 import { enqueue } from "./group-queue.js";
+
+/** A promise plus its resolve, for gating async mocks in concurrency tests. */
+function deferred<T>() {
+  let resolve!: (v: T) => void;
+  const promise = new Promise<T>((r) => { resolve = r; });
+  return { promise, resolve };
+}
 
 const okAuth = { secrets: {}, isApiKeyFallback: false, source: "keychain" as const };
 
@@ -119,5 +127,60 @@ describe("group-queue executeJob", () => {
 
     expect(done.error).toMatch(/unauthorized/);
     expect(runContainer).toHaveBeenCalledTimes(1); // auth errors are terminal
+  });
+
+  it("checks destination identity FIRST — before auth, container, or reply", async () => {
+    vi.mocked(assertDestinationAllowed).mockImplementationOnce(() => { throw new Error("denied"); });
+    const channel = makeChannel();
+
+    const done = await new Promise<{ error?: string }>((resolve) => {
+      enqueue({
+        group: "tg-123", chatId: "999", senderName: "t", text: "x", secrets: {},
+        channel: channel as never, attempt: 1, messageId: 7,
+        onError: (error) => resolve({ error }),
+      });
+    });
+
+    expect(done.error).toMatch(/denied/);
+    expect(getSecrets).not.toHaveBeenCalled();
+    expect(runContainer).not.toHaveBeenCalled();
+    expect(channel.sendMessage).not.toHaveBeenCalled();
+    expect(updateMessageStatus).toHaveBeenCalledWith(7, "failed");
+  });
+
+  it("never runs more than MAX_CONTAINERS_PER_GROUP containers at once for a group", async () => {
+    // Gate every container run so we can inspect the in-flight count.
+    const gates = [deferred<void>(), deferred<void>(), deferred<void>()];
+    let started = 0;
+    let peak = 0;
+    let inFlight = 0;
+    vi.mocked(runContainer).mockImplementation(async () => {
+      inFlight++; peak = Math.max(peak, inFlight);
+      await gates[started++].promise;
+      inFlight--;
+      return { status: "success", result: "ok" };
+    });
+
+    const channel = makeChannel();
+    const base = {
+      group: "tg-123", chatId: "123", senderName: "t", text: "x",
+      secrets: {}, channel: channel as never, attempt: 1,
+    };
+    enqueue({ ...base, messageId: 1 });
+    enqueue({ ...base, messageId: 2 });
+    enqueue({ ...base, messageId: 3 });
+
+    // Let the queue drain to its cap.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(started).toBe(2); // cap = 2 (mocked); the 3rd waits
+
+    // Release the running jobs so the third can start and all finish.
+    gates[0].resolve(); gates[1].resolve();
+    await new Promise((r) => setTimeout(r, 20));
+    gates[2].resolve();
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(peak).toBe(2);
+    expect(started).toBe(3);
   });
 });

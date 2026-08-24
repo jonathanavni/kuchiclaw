@@ -14,8 +14,8 @@ describe("circuit breaker backoff schedule", () => {
 
   it("increments the attempt when the previous start was recent (crash-loop)", () => {
     expect(nextBackoff({ attempt: 1, timestamp: minutesBefore(1) }, T0)).toEqual({ attempt: 2, delaySec: 0 });
-    expect(nextBackoff({ attempt: 2, timestamp: minutesBefore(1) }, T0)).toEqual({ attempt: 3, delaySec: 10 });
-    expect(nextBackoff({ attempt: 4, timestamp: minutesBefore(1) }, T0)).toEqual({ attempt: 5, delaySec: 120 });
+    expect(nextBackoff({ attempt: 2, timestamp: minutesBefore(1) }, T0)).toEqual({ attempt: 3, delaySec: 30 });
+    expect(nextBackoff({ attempt: 4, timestamp: minutesBefore(1) }, T0)).toEqual({ attempt: 5, delaySec: 180 });
   });
 
   it("caps the backoff at the last schedule entry (15 min)", () => {
@@ -49,8 +49,8 @@ describe("enforceStartupBackoff (state file + sleep)", () => {
     fs.writeFileSync(cbPath, JSON.stringify({ attempt: 2, timestamp: minutesBefore(1) }));
     const sleep = vi.fn(async () => {});
     await enforceStartupBackoff({ cbPath, now: () => T0, sleep });
-    // attempt becomes 3 → 10s
-    expect(sleep).toHaveBeenCalledWith(10_000);
+    // attempt becomes 3 → 30s
+    expect(sleep).toHaveBeenCalledWith(30_000);
     expect(JSON.parse(fs.readFileSync(cbPath, "utf-8")).attempt).toBe(3);
   });
 
@@ -61,5 +61,47 @@ describe("enforceStartupBackoff (state file + sleep)", () => {
     const sleep = vi.fn(async () => {});
     await enforceStartupBackoff({ cbPath, now: () => T0, sleep });
     expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it("alerts once as the loop crosses into persistent (attempt 4)", async () => {
+    const alert = vi.fn();
+    const sleep = vi.fn(async () => {});
+    // Attempt 3 → 4 is the crossing.
+    fs.writeFileSync(cbPath, JSON.stringify({ attempt: 3, timestamp: minutesBefore(1) }));
+    await enforceStartupBackoff({ cbPath, now: () => T0, sleep, alert });
+    expect(alert).toHaveBeenCalledTimes(1);
+
+    // A later attempt (5) does not re-alert.
+    alert.mockClear();
+    fs.writeFileSync(cbPath, JSON.stringify({ attempt: 4, timestamp: minutesBefore(1) }));
+    await enforceStartupBackoff({ cbPath, now: () => T0, sleep, alert });
+    expect(alert).not.toHaveBeenCalled();
+  });
+});
+
+describe("backoff outpaces systemd StartLimit", () => {
+  // Regression for the review finding: with StartLimitBurst=5 /
+  // StartLimitIntervalSec=300 / RestartSec=5, a persistent startup-crash loop
+  // must NOT fit 6 starts inside a 300s window, or systemd permanently fails the
+  // unit before the breaker's long backoffs ever apply.
+  it("spaces 6 startup-crash restarts beyond the 300s / 5-start window", () => {
+    const RESTART_SEC = 5;
+    const START_LIMIT_INTERVAL_SEC = 300;
+    // Drive nextBackoff exactly as a real crash-loop would: each start's delay
+    // comes from the prior recorded attempt, then a startup crash happens right
+    // after the sleep, then systemd waits RestartSec before the next start.
+    const startTimes: number[] = [];
+    let t = 0;
+    let prev: { attempt: number; timestamp: string } | null = null;
+    for (let i = 0; i < 6; i++) {
+      startTimes.push(t);
+      const { attempt, delaySec } = nextBackoff(prev, T0);
+      prev = { attempt, timestamp: T0.toISOString() }; // recent → next start increments attempt
+      t += delaySec + RESTART_SEC;
+    }
+    // No 300s window may contain 6 starts (else systemd StartLimitBurst=5 trips).
+    for (let i = 0; i + 5 < startTimes.length; i++) {
+      expect(startTimes[i + 5] - startTimes[i]).toBeGreaterThan(START_LIMIT_INTERVAL_SEC);
+    }
   });
 });
