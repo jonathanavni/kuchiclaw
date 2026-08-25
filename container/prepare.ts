@@ -23,6 +23,7 @@ export interface ContainerInput {
   messageHistory?: string;
   mcpServers?: Record<string, McpServerConfig>;
   model?: string;
+  fallbackModel?: string;
 }
 
 export interface OAuthTokens {

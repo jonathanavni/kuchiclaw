@@ -14,6 +14,7 @@ import {
   BASE_RETRY_MS,
   DELIVERY_MAX_RETRIES,
   DELIVERY_BASE_MS,
+  selectModels,
 } from "./config.js";
 import { assertDestinationAllowed } from "./ipc-auth.js";
 import { AuthUnavailableError } from "./auth.js";
@@ -28,7 +29,8 @@ export interface Job {
   secrets: Record<string, string>;
   channel: Channel;
   mcpServers?: Record<string, McpServerConfig>;
-  /** Model override (e.g., cheaper model for API key fallback) */
+  /** Per-job model override (reserved seam, e.g. scheduled tasks on sonnet).
+   *  Ignored on the API-key path — executeJob downgrades unconditionally there. */
   model?: string;
   attempt: number;
   /** Row ID in messages table — used for processing_status updates */
@@ -83,6 +85,16 @@ export function enqueue(job: Job): void {
   if (!queues.has(group)) queues.set(group, []);
   queues.get(group)!.push(job);
   drain(group);
+}
+
+/** Reset module state for isolated tests only — shutdown() otherwise closes
+ *  queue acceptance for every test that runs after it. */
+export function resetQueueForTest(): void {
+  accepting = true;
+  queues.clear();
+  running.clear();
+  activeJobs.clear();
+  inFlightMessageIds.clear();
 }
 
 /** Stop accepting new jobs. Returns a promise that resolves when all running jobs finish. */
@@ -160,7 +172,8 @@ async function executeJob(job: Job): Promise<void> {
   }
 
   const paths = ensureGroupFolder(group);
-  const model = isApiKeyFallback ? "claude-sonnet-4-6" : job.model;
+  // Model is decided here (not at startup) because auth is re-resolved per job.
+  const { model, fallbackModel } = selectModels(isApiKeyFallback, job.model);
 
   // Load history before this run (user message already stored by caller)
   const recentMessages = getRecentMessages(group);
@@ -180,6 +193,7 @@ async function executeJob(job: Job): Promise<void> {
     messageHistory: messageHistory || undefined,
     mcpServers: job.mcpServers,
     model,
+    fallbackModel,
   };
 
   console.log(`[Queue] Running job for ${senderName} (group: ${group}, attempt: ${job.attempt}/${MAX_RETRIES})`);

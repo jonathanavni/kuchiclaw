@@ -12,6 +12,7 @@ import type { ContainerTerminationUnknownError } from "./container-errors.js";
 import { ensureGroupFolder } from "./group-folder.js";
 import { insertMessage, updateMessageStatus, getRecentMessages, formatHistory } from "./db.js";
 import { getSecrets, getSkillSecrets } from "./auth.js";
+import { selectModels } from "./config.js";
 import { isValidGroupName } from "./ipc-auth.js";
 import type { ContainerInput } from "./types.js";
 
@@ -83,7 +84,7 @@ export async function main() {
   }
 
   const { secrets: authSecrets, isApiKeyFallback } = await getSecrets();
-  const model = isApiKeyFallback ? "claude-sonnet-4-6" : undefined;
+  const { model, fallbackModel } = selectModels(isApiKeyFallback);
   const paths = ensureGroupFolder(group);
 
   // Load recent history from SQLite for conversational context
@@ -101,6 +102,7 @@ export async function main() {
     secrets: { ...getSkillSecrets(group), ...authSecrets },
     messageHistory: messageHistory || undefined,
     model,
+    fallbackModel,
   };
 
   console.error(`[KuchiClaw] Group: ${group} | Prompt: "${prompt.slice(0, 80)}${prompt.length > 80 ? "..." : ""}"`);

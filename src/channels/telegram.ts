@@ -8,6 +8,17 @@ import type { Channel, IncomingMessage } from "./registry.js";
 /** Max message length Telegram allows per message */
 const TELEGRAM_MAX_LENGTH = 4096;
 
+/** Fail closed: a message without a resolvable sender ID is dropped unless the
+ *  operator explicitly opted into allow-all ("*"). The startup gate guarantees
+ *  the list is never empty by the time the channel is connected. */
+export function isAllowedSender(
+  senderId: string | undefined,
+  allowlist: string[] = ALLOWED_SENDER_IDS,
+): boolean {
+  if (allowlist.includes("*")) return true;
+  return senderId !== undefined && allowlist.includes(senderId);
+}
+
 export type MessageHandler = (msg: IncomingMessage) => void;
 
 export class TelegramChannel implements Channel {
@@ -35,12 +46,19 @@ export class TelegramChannel implements Channel {
     const me = await this.bot.getMe();
     this.botUsername = me.username ?? "";
 
-    // Bot commands
+    // /start stays UNGATED on purpose: it's the bootstrap channel. A fresh
+    // operator needs their chat ID (for MAIN_CHAT_ID) and user ID (for
+    // ALLOWED_SENDER_IDS) before the allowlist can name them — and it only
+    // tells the requester their own identifiers.
     this.bot.onText(/\/start/, (msg) => {
-      this.bot!.sendMessage(msg.chat.id, "KuchiClaw is online. Send me a message.");
+      this.bot!.sendMessage(
+        msg.chat.id,
+        `KuchiClaw is online.\nChat ID: ${msg.chat.id}\nYour user ID: ${msg.from?.id ?? "unknown"}`,
+      );
     });
 
     this.bot.onText(/\/status/, (msg) => {
+      if (!isAllowedSender(msg.from?.id ? String(msg.from.id) : undefined)) return;
       const uptimeMs = Date.now() - this.startTime;
       const uptimeMin = Math.floor(uptimeMs / 60_000);
       const statusText = `Status: running\nUptime: ${uptimeMin}m`;
@@ -55,10 +73,7 @@ export class TelegramChannel implements Channel {
       const senderId = msg.from?.id ? String(msg.from.id) : undefined;
       const chatType = msg.chat.type as IncomingMessage["chatType"];
 
-      // Allowlist check — silently ignore senders not on the list
-      if (ALLOWED_SENDER_IDS.length > 0 && senderId && !ALLOWED_SENDER_IDS.includes(senderId)) {
-        return;
-      }
+      if (!isAllowedSender(senderId)) return;
 
       // Group chats require @mention to activate
       let text = msg.text;

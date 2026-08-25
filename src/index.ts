@@ -99,9 +99,18 @@ export function enforceStartupGate(options: StartupGateOptions = {}): void {
     fs.closeSync(fd);
   }
 
+  // Fail closed: an unset allowlist is a config mistake, not a policy choice.
+  // Refusing to start (vs silently denying everyone) makes it discoverable in
+  // the journal and via the OnFailure alert; allow-all must be spelled out.
   if (allowedSenderIds.length === 0) {
+    throw new Error(
+      "ALLOWED_SENDER_IDS is required. Set ALLOWED_SENDER_IDS=<telegram-user-id>[,...] " +
+      "or ALLOWED_SENDER_IDS=* to explicitly allow anyone.",
+    );
+  }
+  if (allowedSenderIds.includes("*")) {
     console.warn(
-      "[SECURITY] WARNING: ALLOWED_SENDER_IDS is empty; any Telegram user who can reach the bot is allowed.",
+      "[SECURITY] WARNING: ALLOWED_SENDER_IDS=* — any Telegram user who can reach the bot is allowed.",
     );
   }
 }
@@ -160,10 +169,10 @@ export async function main(startupOptions: StartupGateOptions = {}): Promise<voi
       throw new Error("TELEGRAM_BOT_TOKEN environment variable is required.");
     }
 
-    const { secrets, isApiKeyFallback } = await getSecrets();
+    // Model selection lives in the queue (per-job, alongside per-job auth) —
+    // this startup getSecrets() is just an early loud failure on bad credentials.
+    const { secrets } = await getSecrets();
     const mcpServers = loadMcpServers();
-    // Use cheaper model when paying per-token via API key
-    const model = isApiKeyFallback ? "claude-sonnet-4-6" : undefined;
     const channel = new TelegramChannel(botToken);
 
     // Register the channel's sendMessage for IPC to use
@@ -205,7 +214,6 @@ export async function main(startupOptions: StartupGateOptions = {}): Promise<voi
         secrets,
         channel,
         mcpServers,
-        model,
         attempt: 1,
         messageId,
       });
@@ -265,12 +273,12 @@ export async function main(startupOptions: StartupGateOptions = {}): Promise<voi
       onContainmentFailure: (error) => requestShutdown("containment", error),
     });
 
-    recoverOrphanedMessages({ secrets, channel, mcpServers, model });
+    recoverOrphanedMessages({ secrets, channel, mcpServers });
 
     await channel.connect();
     startPolling();
-    startScheduler({ secrets, channel, mcpServers, model });
-    startStuckSweep({ secrets, channel, mcpServers, model });
+    startScheduler({ secrets, channel, mcpServers });
+    startStuckSweep({ secrets, channel, mcpServers });
     console.log("[Orchestrator] KuchiClaw is running. Press Ctrl+C to stop.");
 
     process.on("SIGINT", () => requestShutdown("signal"));
@@ -303,7 +311,6 @@ interface RecoveryOptions {
   secrets: Record<string, string>;
   channel: Channel;
   mcpServers?: Record<string, McpServerConfig>;
-  model?: string;
 }
 
 /**
@@ -341,7 +348,6 @@ function reEnqueueOrphan(msg: Message, options: RecoveryOptions, source: string)
     secrets: options.secrets,
     channel: options.channel,
     mcpServers: options.mcpServers,
-    model: options.model,
     attempt: 1,
     messageId: msg.id,
   });

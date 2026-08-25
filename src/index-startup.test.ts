@@ -38,11 +38,19 @@ describe("IPC startup gate", () => {
     expect(inspectDb).not.toHaveBeenCalled();
   });
 
-  it("emits a prominent warning for an empty sender allowlist", () => {
+  it("refuses to start with an empty sender allowlist", () => {
+    fs.writeFileSync(markerPath, "");
+    expect(() => enforceStartupGate(options({
+      allowedSenderIds: [],
+      inspectDb: () => ({ exists: true, userVersion: 2, scheduledTaskCount: 4 }),
+    }))).toThrow(/ALLOWED_SENDER_IDS is required/);
+  });
+
+  it("allows explicit allow-all with a prominent warning", () => {
     fs.writeFileSync(markerPath, "");
     const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
     enforceStartupGate(options({
-      allowedSenderIds: [],
+      allowedSenderIds: ["*"],
       inspectDb: () => ({ exists: true, userVersion: 2, scheduledTaskCount: 4 }),
     }));
     expect(warning).toHaveBeenCalledWith(expect.stringContaining("[SECURITY] WARNING"));

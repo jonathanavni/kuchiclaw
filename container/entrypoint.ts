@@ -69,6 +69,7 @@ export async function runEntrypoint(
       env,
       stderr: (data: string) => { sdkStderr += data; },
       ...(input.model ? { model: input.model } : {}),
+      ...(input.fallbackModel ? { fallbackModel: input.fallbackModel } : {}),
     };
     if (input.mcpServers && Object.keys(input.mcpServers).length > 0) {
       options.mcpServers = input.mcpServers;

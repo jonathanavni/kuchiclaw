@@ -12,10 +12,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          # Must track the deploy target: better-sqlite3 13 segfaults on Node 22
+          node-version: 24
           cache: npm
       - name: Install dependencies
         run: npm ci
+      - name: Container lockfile in sync with manifest
+        run: npm ci --prefix container --dry-run
       - name: Typecheck
         run: npm run build
       - name: Run tests

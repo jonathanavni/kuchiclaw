@@ -17,14 +17,15 @@ else
   echo "Docker already installed."
 fi
 
-# 3. Install Node.js 20 via NodeSource
-echo "[3/6] Installing Node.js 20..."
-if ! command -v node &>/dev/null || ! node -v | grep -q "v20"; then
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+# 3. Install Node.js 24 via NodeSource + sqlite3 CLI (backup.sh dies without it)
+echo "[3/6] Installing Node.js 24..."
+if ! command -v node &>/dev/null || ! node -v | grep -q "^v24\."; then
+  curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
   apt-get install -y nodejs
 else
-  echo "Node.js 20 already installed."
+  echo "Node.js 24 already installed."
 fi
+apt-get install -y sqlite3
 
 # 4. Create kuchiclaw user
 echo "[4/6] Creating kuchiclaw user..."
@@ -56,18 +57,23 @@ if [ ! -f groups/main/CONTEXT.md ]; then
   sudo -u kuchiclaw bash -c 'echo "# Context" > groups/main/CONTEXT.md'
 fi
 
-# 6. Install systemd service + alert watchdog
-echo "[6/6] Installing systemd service..."
+# 6. Install systemd units: service, alert watchdog, and daily backup timer
+echo "[6/6] Installing systemd units..."
 cp /opt/kuchiclaw/kuchiclaw.service /etc/systemd/system/
 cp /opt/kuchiclaw/deploy/kuchiclaw-alert@.service /etc/systemd/system/
+cp /opt/kuchiclaw/deploy/kuchiclaw-backup.service /etc/systemd/system/
+cp /opt/kuchiclaw/deploy/kuchiclaw-backup.timer /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable kuchiclaw
+systemctl enable --now kuchiclaw-backup.timer
 
 echo ""
 echo "=== Setup complete ==="
 echo ""
 echo "Next steps:"
 echo "  1. Create /opt/kuchiclaw/.env with your secrets (see template below)"
+echo "     Do this before 03:00 UTC — the backup timer is already enabled, and"
+echo "     without .env its failure alert cannot fire (alert.sh reads .env)."
 echo "  2. Copy oauth.json: scp data/oauth.json root@SERVER:/opt/kuchiclaw/data/"
 echo "     Then: chown kuchiclaw:kuchiclaw /opt/kuchiclaw/data/oauth.json"
 echo "           chmod 600 /opt/kuchiclaw/data/oauth.json"
@@ -79,4 +85,4 @@ echo "  TELEGRAM_BOT_TOKEN=your-bot-token"
 echo "  FASTMAIL_API_TOKEN=your-fastmail-token"
 echo "  FASTMAIL_GROUPS=main,tg-your-chat-id  # Explicit entitlements; unset/empty injects nowhere"
 echo "  MAIN_CHAT_ID=tg-your-chat-id"
-echo "  ALLOWED_SENDER_IDS=your-telegram-user-id"
+echo "  ALLOWED_SENDER_IDS=your-telegram-user-id  # REQUIRED — the orchestrator refuses to start without it (\"*\" = allow anyone)"

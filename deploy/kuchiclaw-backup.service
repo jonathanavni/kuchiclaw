@@ -2,6 +2,8 @@
 Description=KuchiClaw living file backup
 After=network-online.target
 Wants=network-online.target
+# A silently failing backup is worse than no backup — reuse the Telegram alerter.
+OnFailure=kuchiclaw-alert@%n.service
 
 [Service]
 Type=oneshot

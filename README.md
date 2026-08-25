@@ -56,7 +56,7 @@ KuchiClaw is designed to be forked and customized. The codebase is ~2,000 lines 
 
 ### Prerequisites
 
-- Node.js 20+
+- Node.js 24+
 - Docker
 - A [Claude Max](https://claude.ai) subscription (for OAuth) or an [Anthropic API key](https://console.anthropic.com/)
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
@@ -76,13 +76,13 @@ Create a `.env` file:
 ```bash
 # Required
 TELEGRAM_BOT_TOKEN=your-telegram-bot-token
-MAIN_CHAT_ID=tg-your-chat-id       # Send /start to the bot, it will echo your chat ID
+MAIN_CHAT_ID=tg-your-chat-id       # Send /start to the bot — it echoes your chat ID (prefix with tg-)
+ALLOWED_SENDER_IDS=123456789        # /start also echoes your user ID; comma-separated ("*" = explicitly allow anyone)
 
 # Optional
-ANTHROPIC_API_KEY=sk-ant-...        # Fallback if OAuth isn't set up (auto-downgrades to Sonnet)
+ANTHROPIC_API_KEY=sk-ant-...        # Fallback if OAuth isn't set up (auto-downgrades to Sonnet 5)
 FASTMAIL_API_TOKEN=...              # For the email skill
 FASTMAIL_GROUPS=main,tg-123         # Explicitly entitled groups (unset/empty = no access)
-ALLOWED_SENDER_IDS=123456789        # Comma-separated Telegram user IDs (empty = allow all)
 ```
 
 ### Authentication
@@ -99,7 +99,7 @@ ALLOWED_SENDER_IDS=123456789        # Comma-separated Telegram user IDs (empty =
 
 On macOS, `deploy/export-oauth.sh` extracts tokens from the keychain automatically. Tokens are refreshed at the start of each container run and persisted back to `oauth.json` — no manual rotation needed.
 
-**Option B: API key** — set `ANTHROPIC_API_KEY` in `.env`. Pay-per-use billing. Automatically uses Sonnet 4.6 instead of Opus 4.6 to reduce costs.
+**Option B: API key** — set `ANTHROPIC_API_KEY` in `.env`. Pay-per-use billing. Automatically uses Sonnet 5 instead of Opus to reduce costs.
 
 ### Run
 

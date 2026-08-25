@@ -102,10 +102,39 @@ export const STUCK_THRESHOLD_SEC = 15 * 60;
 /** Max times a message may be re-enqueued by recovery/sweep before it's failed permanently. */
 export const MAX_RECOVERY_ATTEMPTS = 3;
 
+/** Agent model on the OAuth (Claude Max) paths. Aliases track the latest model
+ *  in each family — full IDs would silently pin to a stale snapshot. */
+export const AGENT_MODEL = process.env.AGENT_MODEL?.trim() || "opus";
+
+/** Load-bearing, not an optimization: the Max plan's Opus-only weekly cap is
+ *  shared with the operator's own coding sessions — without a fallback, hitting
+ *  the cap silently drops Telegram replies. */
+export const AGENT_FALLBACK_MODEL = process.env.AGENT_FALLBACK_MODEL?.trim() || "sonnet";
+
+/** Cheaper model for the pay-per-token ANTHROPIC_API_KEY fallback path. */
+export const API_KEY_MODEL = "claude-sonnet-5";
+
+/** The one model-selection policy, shared by the queue and the CLI.
+ *  The API-key path gets the cheap model and no fallback (it pays per token);
+ *  a fallback equal to the primary is omitted — the SDK rejects that pair, and
+ *  e.g. AGENT_MODEL=sonnet with the default fallback would otherwise crash
+ *  every container before startup. */
+export function selectModels(
+  isApiKeyFallback: boolean,
+  override?: string,
+): { model: string; fallbackModel?: string } {
+  if (isApiKeyFallback) return { model: API_KEY_MODEL };
+  const model = override ?? AGENT_MODEL;
+  return AGENT_FALLBACK_MODEL === model
+    ? { model }
+    : { model, fallbackModel: AGENT_FALLBACK_MODEL };
+}
+
 /** Channel-qualified chat ID that maps to the "main" group (e.g., "tg-123456789"). */
 export const MAIN_CHAT_ID = process.env.MAIN_CHAT_ID ?? "";
 
-/** Telegram user IDs allowed to interact with the bot. Empty = allow all. */
+/** Telegram user IDs allowed to interact with the bot. Empty = fail closed at
+ *  startup; the literal entry "*" is the explicit allow-anyone opt-out. */
 export const ALLOWED_SENDER_IDS: string[] = process.env.ALLOWED_SENDER_IDS
   ? process.env.ALLOWED_SENDER_IDS.split(",").map((s) => s.trim()).filter(Boolean)
   : [];

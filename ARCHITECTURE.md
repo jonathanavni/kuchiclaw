@@ -128,11 +128,11 @@ Group folder naming uses `{channel}-{chatId}` (e.g., `tg-123456789`), extensible
 
 ### Authentication
 
-Claude Max OAuth token with automatic refresh. Auth resolution priority:
+Claude Max OAuth token with automatic refresh. Auth resolution priority (reordered in M12 P4.1 — see Auth lineage below):
 
-1. **`data/oauth.json`** — OAuth access token + refresh token stored locally. Both are passed to containers via `ContainerInput`. The container refreshes the token at the start of each run via `POST https://platform.claude.com/v1/oauth/token` (standard OAuth2 refresh_token grant) and returns fresh tokens in `ContainerOutput.newTokens`. The host persists these back to `data/oauth.json`. Refresh happens inside containers rather than on the host because the VPS host is blocked by Cloudflare from `platform.claude.com`; containers have unrestricted network access. If a parallel container already consumed the refresh token, the container falls back to the original access token.
-2. **`ANTHROPIC_API_KEY` env var** — fallback if no `oauth.json` exists. Pay-per-use API billing. Automatically switches to Sonnet 4.6 (instead of Opus 4.6) to reduce costs. Optional.
-3. **`CLAUDE_CODE_OAUTH_TOKEN` env var** — static token override.
+1. **`CLAUDE_CODE_OAUTH_TOKEN` env var** — a dedicated `claude setup-token` grant with its own refresh lineage; the VPS primary path. The refresh token is never passed alongside it.
+2. **`data/oauth.json`** — OAuth access token + refresh token stored locally. Both are passed to containers via `ContainerInput`. The container refreshes the token at the start of each run via `POST https://platform.claude.com/v1/oauth/token` (standard OAuth2 refresh_token grant) and returns fresh tokens in `ContainerOutput.newTokens`. The host persists these back to `data/oauth.json`. Refresh happens inside containers rather than on the host because the VPS host is blocked by Cloudflare from `platform.claude.com`; containers have unrestricted network access. If a parallel container already consumed the refresh token, the container falls back to the original access token.
+3. **`ANTHROPIC_API_KEY` env var** — fallback if no `oauth.json` exists. Pay-per-use API billing. Automatically switches to Sonnet 5 (instead of Opus) to reduce costs. Optional.
 4. **macOS keychain** — local dev only. Claude Code stores credentials in `Claude Code-credentials` keychain entry.
 
 Tokens are passed to containers via stdin — never mounted as files. Skill-specific secrets (e.g., `FASTMAIL_API_TOKEN`) flow through the same stdin mechanism, scoped per group: only containers of groups listed in `FASTMAIL_GROUPS` receive the token (unset = no group does). Inside the container, the refresh token is used and scrubbed before the agent starts — the agent-visible env holds only allowlisted, short-lived or entitled keys.
@@ -213,7 +213,7 @@ Each Telegram chat gets its own group folder with isolated MEMORY.md and CONTEXT
 
 IPC authorization enforced per-group: non-main groups scoped to their own chat and tasks. Main group unrestricted.
 
-Global sender allowlist via `ALLOWED_SENDER_IDS` env var.
+Global sender allowlist via `ALLOWED_SENDER_IDS` env var — fail-closed: the orchestrator refuses to start when it's unset, messages without a resolvable sender ID are dropped, and allow-all must be spelled out as `ALLOWED_SENDER_IDS=*`.
 
 **Key files:** `src/group-mapping.ts`, `src/channels/telegram.ts`, `src/index.ts`, `src/ipc.ts`
 
@@ -279,7 +279,9 @@ Post-MVP hardening driven by a cross-model security audit and a study of how Nan
 
 **Secret scoping.** The agent inside a container is treated as untrusted (prompt injection via messages, web content, or email is assumed), so long-lived credentials are kept out of its reach. The container entrypoint applies an *exact allowlist* of agent-visible env keys and refuses any secret whose value equals the OAuth refresh token — the refresh token is refreshed (with response validation) and scrubbed from the input before the SDK starts, so it is never agent-readable under any key or as any value; refusals surface as structured output warnings the host logs (bounded and sanitized). Skill secrets are explicit-entitlement only: `FASTMAIL_GROUPS` names the groups whose containers receive the Fastmail token (unset means none — fail-closed), validated by the same group-name validators as IPC. The entrypoint's full flow is exported as an injectable function (`runEntrypoint`) so host tests drive the real code path and assert the credential boundary at the exact moment the SDK is invoked. One documented dependency: heap-level isolation of the in-process refresh token relies on the host's `kernel.yama.ptrace_scope=1` (Ubuntu default) combined with `--cap-drop=ALL` — deployments on hosts with `ptrace_scope=0` lose that barrier.
 
-**Key files:** `src/ipc-auth.ts`, `src/circuit-breaker.ts`, `src/container-runner.ts`, `src/docker.ts`, `src/docker-reap.ts`, `src/instance-lock.ts`, `deploy/cutover-m12-p1.sh`, `container/prepare.ts`
+**Runtime & supply chain.** Node 24 across host and container, with the base image digest-pinned and the container's dependency tree locked (`container/package-lock.json` + `npm ci`) so the agent runtime can't drift under a floating tag or transitive resolution. Model selection is explicit: `AGENT_MODEL` (default `opus`) with `AGENT_FALLBACK_MODEL` (default `sonnet`) threaded through to the SDK — the fallback is load-bearing because the Claude Max Opus-only weekly cap is shared with the operator's own coding sessions, and without it hitting the cap silently drops replies. The sender allowlist fails closed (startup refuses an unset `ALLOWED_SENDER_IDS`; allow-all requires a literal `*`), backup provisioning is part of `setup.sh` (timer enabled, `sqlite3` CLI installed, `OnFailure` alert on the backup unit), and `deploy/update.sh` makes pull→rebuild→reinstall a single step so host code and agent image can't skew.
+
+**Key files:** `src/ipc-auth.ts`, `src/circuit-breaker.ts`, `src/container-runner.ts`, `src/docker.ts`, `src/docker-reap.ts`, `src/instance-lock.ts`, `deploy/cutover-m12-p1.sh`, `deploy/update.sh`, `container/prepare.ts`
 
 ### Phase Sequencing Rationale
 
@@ -422,16 +424,13 @@ Hetzner CPX22 (Nuremberg)
 - Production: `.env` file (chmod 600) with systemd `EnvironmentFile`, `data/oauth.json` (chmod 600) for OAuth tokens
 - Secrets are never mounted into containers — always passed via stdin
 
-**Provisioning:** `deploy/setup.sh` installs Docker + Node.js 20, creates the `kuchiclaw` user (in `docker` group), clones the repo, builds the Docker image, and installs the systemd service. OAuth tokens are exported from the dev machine's keychain via `deploy/export-oauth.sh` and transferred via SCP.
+**Provisioning:** `deploy/setup.sh` installs Docker + Node.js 24 + the `sqlite3` CLI (backup.sh needs it), creates the `kuchiclaw` user (in `docker` group), clones the repo, builds the Docker image, and installs all systemd units — service, alert watchdog, and the daily backup timer (enabled immediately). OAuth tokens are exported from the dev machine's keychain via `deploy/export-oauth.sh` and transferred via SCP.
 
-**Update procedure:**
+**Update procedure:** one script, so a `git pull` can never be deployed without the
+matching image rebuild and unit reinstall (that drift is how a host/container skew
+sneaks into production):
 ```bash
-ssh root@your-server
-cd /opt/kuchiclaw
-sudo -u kuchiclaw git pull
-sudo -u kuchiclaw npm install                        # if deps changed
-sudo -u kuchiclaw docker build -t kuchiclaw-agent .  # if Dockerfile/container/ changed
-systemctl restart kuchiclaw
+ssh root@your-server 'bash /opt/kuchiclaw/deploy/update.sh'
 journalctl -u kuchiclaw -f                           # verify
 ```
 

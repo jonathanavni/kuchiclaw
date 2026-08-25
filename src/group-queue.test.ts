@@ -31,7 +31,8 @@ import { getRefreshToken } from "./oauth-refresh.js";
 import { updateMessageStatus, insertMessage } from "./db.js";
 import { assertDestinationAllowed } from "./ipc-auth.js";
 import { ContainerTerminationUnknownError } from "./container-errors.js";
-import { configureLifecycle, enqueue, isMessageInFlight, shutdown } from "./group-queue.js";
+import { configureLifecycle, enqueue, isMessageInFlight, resetQueueForTest, shutdown } from "./group-queue.js";
+import { AGENT_MODEL, AGENT_FALLBACK_MODEL, API_KEY_MODEL } from "./config.js";
 
 /** A promise plus its resolve, for gating async mocks in concurrency tests. */
 function deferred<T>() {
@@ -72,6 +73,7 @@ function runJob(overrides: Record<string, unknown>): Promise<{ result?: string; 
 }
 
 beforeEach(() => {
+  resetQueueForTest();
   vi.clearAllMocks();
   vi.mocked(getSecrets).mockResolvedValue(okAuth);
   vi.mocked(getSkillSecrets).mockReturnValue({});
@@ -329,5 +331,51 @@ describe("group-queue executeJob", () => {
     await finished;
 
     expect(runContainer).toHaveBeenCalledOnce();
+  });
+});
+
+describe("model selection (P6.3)", () => {
+  it("passes the configured model + fallback on the OAuth path", async () => {
+    vi.mocked(runContainer).mockResolvedValue({ status: "success", result: "ok" });
+
+    await runJob({});
+
+    const input = vi.mocked(runContainer).mock.calls[0][0];
+    expect(input.model).toBe(AGENT_MODEL);
+    expect(input.fallbackModel).toBe(AGENT_FALLBACK_MODEL);
+  });
+
+  it("downgrades to the cheaper model with no fallback on the API-key path", async () => {
+    vi.mocked(getSecrets).mockResolvedValue({
+      secrets: {}, isApiKeyFallback: true, source: "api-key",
+    });
+    vi.mocked(runContainer).mockResolvedValue({ status: "success", result: "ok" });
+
+    await runJob({});
+
+    const input = vi.mocked(runContainer).mock.calls[0][0];
+    expect(input.model).toBe(API_KEY_MODEL);
+    expect(input.fallbackModel).toBeUndefined();
+  });
+
+  it("honors a per-job model override on the OAuth path", async () => {
+    vi.mocked(runContainer).mockResolvedValue({ status: "success", result: "ok" });
+
+    await runJob({ model: "haiku" });
+
+    const input = vi.mocked(runContainer).mock.calls[0][0];
+    expect(input.model).toBe("haiku");
+  });
+});
+
+describe("equal model/fallback guard (Codex P6 finding)", () => {
+  it("omits fallbackModel when a per-job override equals the configured fallback", async () => {
+    vi.mocked(runContainer).mockResolvedValue({ status: "success", result: "ok" });
+
+    await runJob({ model: AGENT_FALLBACK_MODEL });
+
+    const input = vi.mocked(runContainer).mock.calls[0][0];
+    expect(input.model).toBe(AGENT_FALLBACK_MODEL);
+    expect(input.fallbackModel).toBeUndefined();
   });
 });

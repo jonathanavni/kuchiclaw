@@ -16,6 +16,9 @@ interface SchedulerDeps {
   secrets: Record<string, string>;
   channel: Channel;
   mcpServers?: Record<string, McpServerConfig>;
+  /** Deliberate reserve seam (no caller sets it today): running scheduled/
+   *  heartbeat tasks on a cheaper model than interactive chat. Unset ⇒ the
+   *  queue's AGENT_MODEL default applies. */
   model?: string;
 }
 

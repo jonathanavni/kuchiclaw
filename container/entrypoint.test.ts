@@ -226,3 +226,42 @@ function snapshottingSuccessfulQuery(
     })();
   });
 }
+
+describe("model threading (P6.3)", () => {
+  function modelRawInput(model?: string, fallbackModel?: string): string {
+    return JSON.stringify({
+      prompt: "hello",
+      groupFolder: "tg-123",
+      chatId: "123",
+      secrets: { CLAUDE_CODE_OAUTH_TOKEN: "existing-short-access" },
+      model,
+      fallbackModel,
+    });
+  }
+
+  it("forwards model and fallbackModel to the SDK options", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const capture: BoundaryCapture = {};
+    const query = snapshottingSuccessfulQuery(capture);
+
+    const output = await runEntrypoint(modelRawInput("opus", "sonnet"), { query, env: {} });
+
+    expect(output.status).toBe("success");
+    const q = JSON.parse(capture.queryJson!);
+    expect(q.options.model).toBe("opus");
+    expect(q.options.fallbackModel).toBe("sonnet");
+  });
+
+  it("omits both keys entirely when unset (SDK default must win)", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const capture: BoundaryCapture = {};
+    const query = snapshottingSuccessfulQuery(capture);
+
+    const output = await runEntrypoint(modelRawInput(), { query, env: {} });
+
+    expect(output.status).toBe("success");
+    const q = JSON.parse(capture.queryJson!);
+    expect(q.options).not.toHaveProperty("model");
+    expect(q.options).not.toHaveProperty("fallbackModel");
+  });
+});
