@@ -358,6 +358,19 @@ describe("runContainer signed-result verification (P5.1)", () => {
     expect(tracked.settlements()).toBe(1);
   });
 
+  it("treats a stdin delivery failure as retryable, not a verification error (Codex F1)", async () => {
+    // A broken stdin pipe means the agent never got its prompt, so no side
+    // effects ran — a re-run is safe. Must NOT become a non-retryable
+    // OutputVerificationError the way a genuine missing result does.
+    const tracked = track(runContainer(input(), paths, { owner: "orchestrator" }));
+    proc.stdin.emit("error", new Error("EPIPE"));
+    proc.emit("close", 1);
+
+    await expect(tracked.promise).rejects.toThrow(/delivery failed/);
+    await expect(tracked.promise).rejects.not.toBeInstanceOf(OutputVerificationError);
+    expect(tracked.settlements()).toBe(1);
+  });
+
   it("cleans up the per-run output directory after settling", async () => {
     const tracked = track(runContainer(input(), paths, { owner: "orchestrator" }));
     const { runDir } = runInfo(proc);

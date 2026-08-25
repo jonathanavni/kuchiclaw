@@ -1,5 +1,5 @@
 import { createHmac } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { closeSync, constants as fsConstants, existsSync, openSync, readSync } from "node:fs";
 
 export const AGENT_VISIBLE_SECRET_KEYS = [
   "CLAUDE_CODE_OAUTH_TOKEN",
@@ -144,19 +144,42 @@ export function assembleSystemPrompt(input: ContainerInput): string {
  *  SOUL.md housekeeping instruction, not a replacement for it. */
 export const LIVING_FILE_MAX_BYTES = 64 * 1024;
 
-/** Truncate to the byte budget with a notice the agent can act on. Exported for tests. */
+/** Truncate to the byte budget with a notice the agent can act on. The notice's
+ *  own bytes are reserved so the returned value never exceeds the budget.
+ *  Exported for tests. */
 export function capLivingFile(content: string, path: string): string {
   if (Buffer.byteLength(content, "utf8") <= LIVING_FILE_MAX_BYTES) return content;
+  const notice = `\n\n> [TRUNCATED] ${path} exceeds the ${LIVING_FILE_MAX_BYTES / 1024}KB context ` +
+    "budget — the rest of this file was not loaded. Tighten it per your memory-housekeeping rules.";
+  const budget = Math.max(0, LIVING_FILE_MAX_BYTES - Buffer.byteLength(notice, "utf8"));
   const truncated = Buffer.from(content, "utf8")
-    .subarray(0, LIVING_FILE_MAX_BYTES)
+    .subarray(0, budget)
     .toString("utf8")
     .replace(/�+$/, ""); // a byte-boundary cut can split the last code point
-  return `${truncated}\n\n> [TRUNCATED] ${path} exceeds the ${LIVING_FILE_MAX_BYTES / 1024}KB context budget — ` +
-    "the rest of this file was not loaded. Tighten it per your memory-housekeeping rules.";
+  return truncated + notice;
+}
+
+/** Read at most LIVING_FILE_MAX_BYTES+1 bytes so a same-uid agent that grows its
+ *  rw-mounted MEMORY.md/CONTEXT.md to gigabytes can't OOM the entrypoint before
+ *  it signs a result — the whole file is never loaded into memory. */
+function readCappedFile(path: string): string {
+  const fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const buffer = Buffer.alloc(LIVING_FILE_MAX_BYTES + 1);
+    let total = 0;
+    while (total < buffer.length) {
+      const bytesRead = readSync(fd, buffer, total, buffer.length - total, null);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+    }
+    return buffer.subarray(0, total).toString("utf8");
+  } finally {
+    closeSync(fd);
+  }
 }
 
 function readIfExists(path: string): string {
-  return existsSync(path) ? capLivingFile(readFileSync(path, "utf-8"), path) : "";
+  return existsSync(path) ? capLivingFile(readCappedFile(path), path) : "";
 }
 
 /** Existing in-container refresh request, kept byte-for-byte in behavior. */

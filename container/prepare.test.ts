@@ -162,10 +162,12 @@ describe("living-file budget (P5.3)", () => {
     expect(capLivingFile("# Memory\n\nfacts", "/workspace/MEMORY.md")).toBe("# Memory\n\nfacts");
   });
 
-  it("truncates an oversized file at the byte budget with an actionable notice", () => {
+  it("truncates an oversized file within the byte budget, notice included (Codex F2)", () => {
     const big = "m".repeat(LIVING_FILE_MAX_BYTES + 1000);
     const out = capLivingFile(big, "/workspace/MEMORY.md");
-    expect(out.length).toBeLessThan(big.length);
+    // The notice's own bytes must be reserved — the returned value never exceeds
+    // the budget (the old impl appended the notice AFTER taking the full cap).
+    expect(Buffer.byteLength(out, "utf8")).toBeLessThanOrEqual(LIVING_FILE_MAX_BYTES);
     expect(out).toContain("[TRUNCATED] /workspace/MEMORY.md");
     expect(out).toContain("memory-housekeeping");
   });

@@ -219,13 +219,22 @@ export function getRecentMessages(groupFolder: string, limit = 20): Message[] {
   return rows.reverse();
 }
 
-/** Strip C0/C1 control characters; `keepNewlines` preserves \n and \t for bodies. */
+/** Collapse every newline-equivalent (CRLF, CR, NEL, U+2028/2029) to a plain \n
+ *  so the body-indent step below indents ALL attacker lines — a raw U+2028 would
+ *  otherwise start a fresh unindented visual line the model reads as structure. */
+function normalizeNewlines(text: string): string {
+  // eslint-disable-next-line no-control-regex
+  return text.replace(/\r\n?|[\u0085\u2028\u2029]/g, "\n");
+}
+
+/** Strip C0/C1 control characters; `keepNewlines` preserves \n and \t for bodies.
+ *  Names keep nothing structural: newline-equivalents (incl. U+2028/2029) become spaces. */
 function sanitizeForPrompt(text: string, keepNewlines: boolean): string {
   return keepNewlines
     // eslint-disable-next-line no-control-regex
     ? text.replace(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g, "")
     // eslint-disable-next-line no-control-regex
-    : text.replace(/[\u0000-\u001F\u007F-\u009F]/g, " ");
+    : text.replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]/g, " ");
 }
 
 /** Body lines are indented four spaces. Three would be defeated: CommonMark
@@ -254,7 +263,7 @@ export function formatHistory(messages: Message[]): string {
 
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
-    let content = sanitizeForPrompt(m.content, true);
+    let content = sanitizeForPrompt(normalizeNewlines(m.content), true);
     if (content.length > HISTORY_MESSAGE_MAX_CHARS) {
       content = `${content.slice(0, HISTORY_MESSAGE_MAX_CHARS)} …[truncated]`;
     }

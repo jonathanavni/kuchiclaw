@@ -109,29 +109,48 @@ export async function runContainer(
       if (state === "running") finalizeNormalClose();
     });
 
-    proc.stdin?.on("error", () => {
-      // Docker's close/error events carry the authoritative spawn/run outcome.
-    });
+    // A stdin 'error' fires only when the container's read end closes before it
+    // consumed our input — i.e. delivery failed and the agent could not have run
+    // (incomplete input fails parseInput). That makes any later missing result
+    // retry-safe: no prompt reached the agent, so no side effects occurred.
+    let stdinFailed = false;
+    proc.stdin?.on("error", () => { stdinFailed = true; });
     try {
       proc.stdin?.write(JSON.stringify(signedInput));
       proc.stdin?.end();
     } catch (err) {
-      settle(() => reject(new Error(`Failed to write container input: ${formatError(err)}`)));
+      // A synchronous throw leaves a spawned container that may hang on an EOF we
+      // never sent, so route through termination to kill+confirm it (no stray, no
+      // concurrent retry before death) rather than settling it out from under it.
+      stdinFailed = true;
+      console.error(`[Container] Input delivery failed: ${formatError(err)}`);
+      if (state === "running") {
+        state = "terminating";
+        void finalizeTermination();
+      }
     }
 
     function finalizeNormalClose(): void {
       try {
         const read = readSignedResult(runDir, outputKey);
         if (read.kind === "ok") {
+          // readSignedResult never throws and persistNewTokens self-catches, so
+          // this success bookkeeping can't fall into the retryable catch below.
           logWarnings(read.output);
           persistNewTokens(read.output);
           settle(() => resolve(read.output));
           return;
         }
+        if (read.kind === "missing" && stdinFailed) {
+          // Incomplete input reached the container — the agent never ran, so a
+          // transient transport failure is safe to retry (generic Error).
+          settle(() => reject(new Error("Container input delivery failed before the agent ran")));
+          return;
+        }
         // The container ran (it closed cleanly), so a missing or tampered result
         // is non-retryable: a re-run would repeat any side effects the agent
-        // already performed. Only host-observed pre-start failures (spawn/stdin,
-        // above) stay retryable.
+        // already performed. Only host-observed pre-start failures (spawn/stdin)
+        // stay retryable.
         settle(() => reject(outputFailure(read, closeCode, stdout.get(), stderr.get())));
       } catch (err) {
         settle(() => reject(new Error(`Container output handling failed: ${formatError(err)}`)));
@@ -169,6 +188,10 @@ export async function runContainer(
             `Container ${containerName} termination could not be confirmed: ${termination.detail}`,
           );
           if (!output) rejection = containment;
+        } else if (stdinFailed) {
+          // Input never fully reached the agent, so it couldn't have run — a
+          // retry is side-effect-safe (generic Error → queue retries).
+          rejection = new Error(`Container ${containerName} input delivery failed before the agent ran`);
         } else if (!output) {
           // Container ran to its timeout without a valid result — non-retryable
           // (it may have side-effected); a bare timeout with no file included.
