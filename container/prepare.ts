@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 
 export const AGENT_VISIBLE_SECRET_KEYS = [
@@ -5,6 +6,23 @@ export const AGENT_VISIBLE_SECRET_KEYS = [
   "ANTHROPIC_API_KEY",
   "FASTMAIL_API_TOKEN",
 ] as const;
+
+// Result-transport constants — kept byte-identical to src/config.ts (parity test).
+export const RESULT_FILENAME = "result.json";
+export const RESULT_TMP_FILENAME = "result.json.tmp";
+export const RESULT_ENVELOPE_VERSION = 1;
+export const CONTAINER_OUTPUT_DIR = "/workspace/.out";
+
+/** Build the signed result envelope. The HMAC covers the serialized payload;
+ *  the host verifies it with the same per-run key, so a same-uid agent that
+ *  overwrites the file cannot forge a passing envelope without the key. */
+export function signEnvelope(payload: unknown, outputKey: string): string {
+  const payloadString = JSON.stringify(payload);
+  const hmac = createHmac("sha256", Buffer.from(outputKey, "hex"))
+    .update(payloadString, "utf8")
+    .digest("hex");
+  return JSON.stringify({ v: RESULT_ENVELOPE_VERSION, hmac, payload: payloadString });
+}
 
 export interface McpServerConfig {
   command: string;
@@ -26,6 +44,7 @@ export interface ContainerInput {
   mcpServers?: Record<string, McpServerConfig>;
   model?: string;
   fallbackModel?: string;
+  outputKey?: string;
 }
 
 export interface OAuthTokens {

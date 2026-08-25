@@ -33,6 +33,9 @@ export interface ContainerInput {
   model?: string;
   /** Model the SDK falls back to when `model` is capacity-limited (e.g. the Opus weekly cap) */
   fallbackModel?: string;
+  /** Per-run HMAC key (hex) the container signs its result file with. Host-generated,
+   *  scrubbed from `input` before any agent code runs, never placed in env. */
+  outputKey?: string;
 }
 
 /** IPC request written by the container to the mounted IPC directory */
@@ -84,11 +87,10 @@ export interface TaskRunLog {
   error: string | null;
 }
 
-/** Output received from the container via stdout sentinel markers */
+/** Output received from the container via the HMAC-signed result file */
 export interface ContainerOutput {
   status: "success" | "error";
   result?: string;
-  newSessionId?: string;
   error?: string;
   /** Refused secret names surfaced to the host even when the run succeeds. */
   warnings?: string[];

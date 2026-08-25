@@ -1,5 +1,6 @@
+import { createHmac } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AGENT_VISIBLE_SECRET_KEYS } from "./prepare.js";
+import { AGENT_VISIBLE_SECRET_KEYS, RESULT_ENVELOPE_VERSION } from "./prepare.js";
 import { getProductionExitCode, runEntrypoint, type QueryFn } from "./entrypoint.js";
 
 afterEach(() => {
@@ -178,6 +179,77 @@ describe("runEntrypoint refresh boundary", () => {
   });
 });
 
+describe("signed result transport (P5.1)", () => {
+  const outputKey = "ab".repeat(32); // 32-byte hex
+
+  it("writes a valid signed envelope the host can verify with the per-run key", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const capture: BoundaryCapture = {};
+    let envelope: string | undefined;
+
+    const output = await runEntrypoint(rawInput(undefined, undefined, outputKey), {
+      env: {},
+      query: snapshottingSuccessfulQuery(capture),
+      writeResult: (e) => { envelope = e; },
+    });
+
+    expect(envelope).toBeDefined();
+    const parsed = JSON.parse(envelope!) as { v: number; hmac: string; payload: string };
+    expect(parsed.v).toBe(RESULT_ENVELOPE_VERSION);
+    const expected = createHmac("sha256", Buffer.from(outputKey, "hex"))
+      .update(parsed.payload, "utf8").digest("hex");
+    expect(parsed.hmac).toBe(expected);
+    expect(JSON.parse(parsed.payload)).toMatchObject({ status: "success", result: "done" });
+    expect(output.status).toBe("success");
+  });
+
+  it("scrubs the output key from the agent boundary and never emits it in env or prompt", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const capture: BoundaryCapture = {};
+
+    await runEntrypoint(rawInput(undefined, undefined, outputKey), {
+      env: {},
+      query: snapshottingSuccessfulQuery(capture),
+      observe: snapshotObserver(capture),
+      writeResult: () => {},
+    });
+
+    const boundary = JSON.parse(capture.observeJson!);
+    expect(boundary.input).not.toHaveProperty("outputKey");
+    expect(capture.observeJson).not.toContain(outputKey);
+    expect(capture.queryEnvJson).not.toContain(outputKey);
+    expect(capture.queryJson).not.toContain(outputKey);
+  });
+
+  it("refuses a secret whose value equals the output key", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const capture: BoundaryCapture = {};
+
+    const output = await runEntrypoint(
+      rawInput(undefined, { CLAUDE_CODE_OAUTH_TOKEN: outputKey }, outputKey),
+      {
+        env: {},
+        query: snapshottingSuccessfulQuery(capture),
+        observe: snapshotObserver(capture),
+        writeResult: () => {},
+      },
+    );
+
+    expect(output.warnings).toEqual(["refused secret key: CLAUDE_CODE_OAUTH_TOKEN"]);
+    expect(JSON.parse(capture.queryEnvJson!)).toEqual({});
+    expect(capture.queryEnvJson).not.toContain(outputKey);
+  });
+
+  it("writes nothing when no output key is supplied", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const writeResult = vi.fn();
+
+    await runEntrypoint(rawInput(), { env: {}, query: snapshottingSuccessfulQuery({}), writeResult });
+
+    expect(writeResult).not.toHaveBeenCalled();
+  });
+});
+
 it("uses a nonzero production exit code only for crash-level errors", () => {
   expect(getProductionExitCode({ status: "error", error: "Container crashed: boom" })).toBe(1);
   expect(getProductionExitCode({ status: "error", error: "Agent stopped: failure" })).toBe(0);
@@ -187,6 +259,7 @@ it("uses a nonzero production exit code only for crash-level errors", () => {
 function rawInput(
   refreshToken?: string,
   secrets: Record<string, string> = { CLAUDE_CODE_OAUTH_TOKEN: "existing-short-access" },
+  outputKey?: string,
 ): string {
   return JSON.stringify({
     prompt: "hello",
@@ -194,6 +267,7 @@ function rawInput(
     chatId: "123",
     secrets,
     refreshToken,
+    outputKey,
     systemPrompt: "trusted system prompt",
     messageHistory: "recent messages",
   });

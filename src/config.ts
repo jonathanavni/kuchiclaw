@@ -18,9 +18,21 @@ export const DATA_DIR = path.join(PROJECT_ROOT, "data");
 /** Docker image name for agent containers */
 export const CONTAINER_IMAGE = process.env.CONTAINER_IMAGE?.trim() || "kuchiclaw-agent";
 
-/** Sentinel markers for parsing container output */
-export const OUTPUT_START_MARKER = "---KUCHICLAW_OUTPUT_START---";
-export const OUTPUT_END_MARKER = "---KUCHICLAW_OUTPUT_END---";
+/** Container result transport: the agent's output is written to an HMAC-signed
+ *  file on a per-run rw mount, not stdout — a prompt-injected agent shares the
+ *  entrypoint's uid and could otherwise forge the whole ContainerOutput
+ *  (including newTokens) by writing the process's stdout fd. Keep these in sync
+ *  with the container-side copies in container/prepare.ts (a parity test pins it). */
+export const RESULT_FILENAME = "result.json";
+export const RESULT_TMP_FILENAME = "result.json.tmp";
+export const RESULT_ENVELOPE_VERSION = 1;
+/** Mount destination for the per-run output directory, inside the container. */
+export const CONTAINER_OUTPUT_DIR = "/workspace/.out";
+/** Host read cap for the signed result file. */
+export const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
+/** Cap on retained stdout/stderr diagnostics (tail kept) so an agent that
+ *  floods either stream can't exhaust orchestrator memory. */
+export const MAX_DIAGNOSTIC_BYTES = 64 * 1024;
 
 /** Container timeout in milliseconds (5 minutes default) */
 export const CONTAINER_TIMEOUT_MS = 5 * 60 * 1000;

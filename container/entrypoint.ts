@@ -1,19 +1,28 @@
 #!/usr/bin/env node
 
+import {
+  closeSync,
+  fsyncSync,
+  openSync,
+  renameSync,
+  writeSync,
+  constants as fsConstants,
+} from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  CONTAINER_OUTPUT_DIR,
+  RESULT_FILENAME,
+  RESULT_TMP_FILENAME,
   applySecretsToEnv,
   assembleSystemPrompt,
   parseInput,
   refreshAuth,
+  signEnvelope,
   type AgentEnv,
   type ContainerInput,
   type OAuthTokens,
 } from "./prepare.js";
-
-const OUTPUT_START = "---KUCHICLAW_OUTPUT_START---";
-const OUTPUT_END = "---KUCHICLAW_OUTPUT_END---";
 
 interface ContainerOutput {
   status: "success" | "error";
@@ -22,6 +31,10 @@ interface ContainerOutput {
   newTokens?: OAuthTokens;
   warnings?: string[];
 }
+
+/** Sink for the signed envelope — a seam so tests spy instead of touching the
+ *  filesystem. Production writes it atomically to the mounted output dir. */
+export type WriteResultFn = (envelope: string) => void;
 
 interface QueryArgs {
   prompt: string;
@@ -33,6 +46,7 @@ export type QueryFn = (args: QueryArgs) => AsyncIterable<unknown>;
 export interface EntrypointDeps {
   query: QueryFn;
   env?: AgentEnv;
+  writeResult?: WriteResultFn;
   observe?: (state: {
     input: ContainerInput;
     env: AgentEnv;
@@ -47,11 +61,25 @@ export async function runEntrypoint(
   let sdkStderr = "";
   let warnings: string[] = [];
   let newTokens: OAuthTokens | undefined;
+  // The signing key is needed at emit() — after untrusted agent code runs — so
+  // it cannot be consumed-then-dropped like refreshToken. It lives only in this
+  // closure local: never in env (/proc/pid/environ is same-uid readable), and
+  // the property is deleted from `input` before observe/options are built.
+  let outputKey: string | undefined;
+
+  const emit = (output: ContainerOutput): ContainerOutput => {
+    if (outputKey !== undefined && deps.writeResult) {
+      deps.writeResult(signEnvelope(output, outputKey));
+    }
+    return output;
+  };
 
   try {
     const input = parseInput(raw);
+    outputKey = input.outputKey;
+    delete input.outputKey;
     const env = deps.env ?? process.env;
-    warnings = applySecretsToEnv(input.secrets, env, [input.refreshToken]);
+    warnings = applySecretsToEnv(input.secrets, env, [input.refreshToken, outputKey]);
     newTokens = await refreshAuth(input, env);
     const systemPrompt = assembleSystemPrompt(input);
     // maxTurns is a circuit breaker against runaway loops, not a primary control —
@@ -132,11 +160,22 @@ function withMetadata(
   };
 }
 
-function emit(output: ContainerOutput): ContainerOutput {
-  console.log(OUTPUT_START);
-  console.log(JSON.stringify(output));
-  console.log(OUTPUT_END);
-  return output;
+/** Atomically publish the signed envelope: exclusive-create the temp file
+ *  (O_EXCL|O_NOFOLLOW defeats a pre-planted symlink/FIFO from the same-uid
+ *  agent — a collision fails the write, which is denial, never forgery), fsync,
+ *  then rename over the result path so the host never reads a partial file. */
+function writeResultFile(envelope: string): void {
+  const tmpPath = path.join(CONTAINER_OUTPUT_DIR, RESULT_TMP_FILENAME);
+  const finalPath = path.join(CONTAINER_OUTPUT_DIR, RESULT_FILENAME);
+  const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW;
+  const fd = openSync(tmpPath, flags, 0o600);
+  try {
+    writeSync(fd, envelope);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  renameSync(tmpPath, finalPath);
 }
 
 async function readStdin(): Promise<string> {
@@ -155,7 +194,10 @@ export function getProductionExitCode(output: {
 async function main(): Promise<void> {
   const raw = await readStdin();
   const sdk = await import("@anthropic-ai/claude-agent-sdk");
-  const output = await runEntrypoint(raw, { query: sdk.query as QueryFn });
+  const output = await runEntrypoint(raw, {
+    query: sdk.query as QueryFn,
+    writeResult: writeResultFile,
+  });
   if (getProductionExitCode(output) === 1) {
     process.exitCode = 1;
   }
@@ -163,8 +205,11 @@ async function main(): Promise<void> {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().catch((err) => {
+    // No signing key is available outside runEntrypoint (parseInput may not have
+    // run), so no authentic result file can be written. Log and exit nonzero;
+    // the host sees a missing result and fails the job without a retry.
     const message = err instanceof Error ? err.message : String(err);
-    emit({ status: "error", error: `Container crashed: ${message}` });
+    console.error(`[entrypoint] Container crashed: ${message}`);
     process.exit(1);
   });
 }

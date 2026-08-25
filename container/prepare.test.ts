@@ -1,15 +1,22 @@
+import { createHmac } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SKILL_SECRET_SPECS } from "../src/auth.js";
 import {
   AGENT_VISIBLE_SECRET_KEYS,
+  CONTAINER_OUTPUT_DIR,
   LIVING_FILE_MAX_BYTES,
+  RESULT_ENVELOPE_VERSION,
+  RESULT_FILENAME,
+  RESULT_TMP_FILENAME,
   applySecretsToEnv,
   buildSessionContext,
   capLivingFile,
   parseInput,
   refreshAuth,
+  signEnvelope,
   type ContainerInput,
 } from "./prepare.js";
+import * as hostConfig from "../src/config.js";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -169,5 +176,25 @@ describe("living-file budget (P5.3)", () => {
     const out = capLivingFile(`${filler}😀😀😀`, "/workspace/CONTEXT.md");
     expect(out).not.toContain("�");
     expect(out).toContain("[TRUNCATED]");
+  });
+});
+
+describe("result-transport parity with host config (P5.1)", () => {
+  it("keeps the envelope constants byte-identical across the boundary", () => {
+    expect(RESULT_FILENAME).toBe(hostConfig.RESULT_FILENAME);
+    expect(RESULT_TMP_FILENAME).toBe(hostConfig.RESULT_TMP_FILENAME);
+    expect(RESULT_ENVELOPE_VERSION).toBe(hostConfig.RESULT_ENVELOPE_VERSION);
+    expect(CONTAINER_OUTPUT_DIR).toBe(hostConfig.CONTAINER_OUTPUT_DIR);
+  });
+
+  it("signEnvelope produces a host-verifiable HMAC envelope", () => {
+    const key = "cd".repeat(32);
+    const envelope = JSON.parse(signEnvelope({ status: "success", result: "hi" }, key));
+    expect(envelope.v).toBe(RESULT_ENVELOPE_VERSION);
+    expect(JSON.parse(envelope.payload)).toEqual({ status: "success", result: "hi" });
+    // Same key + payload must reproduce the digest (host verification path).
+    const expected = createHmac("sha256", Buffer.from(key, "hex"))
+      .update(envelope.payload, "utf8").digest("hex");
+    expect(envelope.hmac).toBe(expected);
   });
 });
