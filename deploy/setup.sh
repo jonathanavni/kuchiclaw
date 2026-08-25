@@ -25,7 +25,9 @@ if ! command -v node &>/dev/null || ! node -v | grep -q "^v24\."; then
 else
   echo "Node.js 24 already installed."
 fi
-apt-get install -y sqlite3
+# sqlite3: backup.sh needs the CLI. build-essential/python3: native modules
+# (better-sqlite3) may compile from source under npm ci.
+apt-get install -y sqlite3 build-essential python3
 
 # 4. Create kuchiclaw user
 echo "[4/6] Creating kuchiclaw user..."
