@@ -23,6 +23,10 @@ export interface ContainerInput {
   systemPrompt?: string;
   /** Recent message history formatted for injection into the prompt */
   messageHistory?: string;
+  /** Human-readable "now" in the agent's timezone, computed host-side at spawn */
+  currentTime?: string;
+  /** IANA timezone that governs both display and cron interpretation */
+  timezone?: string;
   /** MCP server configs to pass to the SDK */
   mcpServers?: Record<string, McpServerConfig>;
   /** Model for the SDK query — unset lets the SDK pick its default */

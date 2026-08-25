@@ -58,3 +58,40 @@ describe("selectModels (P6.3)", () => {
     expect(selectModels(false, AGENT_FALLBACK_MODEL)).toEqual({ model: AGENT_FALLBACK_MODEL });
   });
 });
+
+describe("AGENT_TIMEZONE + formatAgentTime (P5.2)", () => {
+  const originalTz = process.env.AGENT_TIMEZONE;
+
+  afterEach(() => {
+    if (originalTz === undefined) delete process.env.AGENT_TIMEZONE;
+    else process.env.AGENT_TIMEZONE = originalTz;
+  });
+
+  it("defaults to UTC when unset (pre-P5 behavior preserved)", async () => {
+    delete process.env.AGENT_TIMEZONE;
+    const { AGENT_TIMEZONE } = await import("./config.js");
+    expect(AGENT_TIMEZONE).toBe("UTC");
+  });
+
+  it("warns and falls back to UTC for a non-IANA zone", async () => {
+    process.env.AGENT_TIMEZONE = "Middle-Earth/Hobbiton";
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { AGENT_TIMEZONE } = await import("./config.js");
+    expect(AGENT_TIMEZONE).toBe("UTC");
+    expect(warning).toHaveBeenCalledWith(
+      expect.stringContaining('Invalid AGENT_TIMEZONE="Middle-Earth/Hobbiton"'),
+    );
+  });
+
+  it("accepts a valid IANA zone and formats times in it", async () => {
+    // Kolkata: fixed UTC+5:30, no DST — assertions stable year-round.
+    process.env.AGENT_TIMEZONE = "Asia/Kolkata";
+    const { AGENT_TIMEZONE, formatAgentTime } = await import("./config.js");
+    expect(AGENT_TIMEZONE).toBe("Asia/Kolkata");
+    const formatted = formatAgentTime(new Date("2026-01-15T12:00:00Z"));
+    expect(formatted).toContain("2026-01-15");
+    expect(formatted).toContain("17:30:00");
+    expect(formatted).toContain("Thu");
+    expect(formatted).toMatch(/GMT\+5:30/);
+  });
+});

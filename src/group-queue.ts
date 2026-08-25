@@ -9,11 +9,13 @@ import { getSecrets, getSkillSecrets } from "./auth.js";
 import { getRefreshToken } from "./oauth-refresh.js";
 import { insertMessage, getRecentMessages, formatHistory, updateMessageStatus } from "./db.js";
 import {
+  AGENT_TIMEZONE,
   MAX_CONTAINERS_PER_GROUP,
   MAX_RETRIES,
   BASE_RETRY_MS,
   DELIVERY_MAX_RETRIES,
   DELIVERY_BASE_MS,
+  formatAgentTime,
   selectModels,
 } from "./config.js";
 import { assertDestinationAllowed } from "./ipc-auth.js";
@@ -191,6 +193,8 @@ async function executeJob(job: Job): Promise<void> {
     // stale oauth.json lineage clobber the grant — the exact crash-loop P4.1 removes.
     refreshToken: source === "oauth-json" ? getRefreshToken() ?? undefined : undefined,
     messageHistory: messageHistory || undefined,
+    currentTime: formatAgentTime(),
+    timezone: AGENT_TIMEZONE,
     mcpServers: job.mcpServers,
     model,
     fallbackModel,

@@ -4,7 +4,7 @@
 // previous next_run, not Date.now()).
 
 import { CronExpressionParser } from "cron-parser";
-import { SCHEDULER_POLL_MS } from "./config.js";
+import { AGENT_TIMEZONE, SCHEDULER_POLL_MS } from "./config.js";
 import { getDueTasks, updateTaskNextRun, updateTaskStatus, insertTaskRunLog } from "./db.js";
 import { enqueue } from "./group-queue.js";
 import { assertDestinationAllowed } from "./ipc-auth.js";
@@ -131,7 +131,7 @@ function advanceNextRun(task: ScheduledTask): void {
       try {
         const expr = CronExpressionParser.parse(task.schedule_value, {
           currentDate: new Date(task.next_run),
-          tz: "UTC",
+          tz: AGENT_TIMEZONE,
         });
         const next = expr.next().toDate().toISOString();
         updateTaskNextRun(task.id, next);

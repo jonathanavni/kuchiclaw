@@ -21,6 +21,8 @@ export interface ContainerInput {
   refreshToken?: string;
   systemPrompt?: string;
   messageHistory?: string;
+  currentTime?: string;
+  timezone?: string;
   mcpServers?: Record<string, McpServerConfig>;
   model?: string;
   fallbackModel?: string;
@@ -99,6 +101,12 @@ export function buildSessionContext(input: ContainerInput): string {
   const parts: string[] = [];
   if (input.groupFolder) parts.push(`Group: ${input.groupFolder}`);
   if (input.chatId) parts.push(`Chat ID: ${input.chatId}`);
+  if (input.currentTime) parts.push(`Current time: ${input.currentTime}`);
+  if (input.timezone) {
+    // One zone governs both display and cron — stating it here prevents the
+    // agent from converting to UTC before writing task_create cron expressions.
+    parts.push(`Timezone: ${input.timezone} (scheduled-task cron expressions are interpreted in this timezone)`);
+  }
   return parts.join("\n");
 }
 
@@ -112,8 +120,24 @@ export function assembleSystemPrompt(input: ContainerInput): string {
   return prompt;
 }
 
+/** Per-file context budget for injected living files. The agent grows MEMORY.md
+ *  and CONTEXT.md without bound (rw mounts); this is the mechanism behind the
+ *  SOUL.md housekeeping instruction, not a replacement for it. */
+export const LIVING_FILE_MAX_BYTES = 64 * 1024;
+
+/** Truncate to the byte budget with a notice the agent can act on. Exported for tests. */
+export function capLivingFile(content: string, path: string): string {
+  if (Buffer.byteLength(content, "utf8") <= LIVING_FILE_MAX_BYTES) return content;
+  const truncated = Buffer.from(content, "utf8")
+    .subarray(0, LIVING_FILE_MAX_BYTES)
+    .toString("utf8")
+    .replace(/�+$/, ""); // a byte-boundary cut can split the last code point
+  return `${truncated}\n\n> [TRUNCATED] ${path} exceeds the ${LIVING_FILE_MAX_BYTES / 1024}KB context budget — ` +
+    "the rest of this file was not loaded. Tighten it per your memory-housekeeping rules.";
+}
+
 function readIfExists(path: string): string {
-  return existsSync(path) ? readFileSync(path, "utf-8") : "";
+  return existsSync(path) ? capLivingFile(readFileSync(path, "utf-8"), path) : "";
 }
 
 /** Existing in-container refresh request, kept byte-for-byte in behavior. */

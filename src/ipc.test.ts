@@ -5,7 +5,8 @@ import { execute, registerSender } from "./ipc.js";
 
 vi.mock("./config.js", async () => {
   const actual = await vi.importActual<typeof import("./config.js")>("./config.js");
-  return { ...actual, MAIN_CHAT_ID: "tg-999" };
+  // Kolkata has no DST, so the cron-timezone assertion is stable year-round.
+  return { ...actual, MAIN_CHAT_ID: "tg-999", AGENT_TIMEZONE: "Asia/Kolkata" };
 });
 
 beforeEach(() => {
@@ -55,6 +56,21 @@ describe("IPC mount-derived authorization", () => {
       expect(getTasksByGroup("tg-123")).toHaveLength(0);
     },
   );
+
+  it("interprets task_create cron expressions in AGENT_TIMEZONE (P5.2)", async () => {
+    await execute({
+      op: "task_create",
+      chatId: "123",
+      prompt: "morning brief",
+      scheduleType: "cron",
+      scheduleValue: "0 9 * * *",
+    }, "tg-123", false);
+    const [task] = getTasksByGroup("tg-123");
+    // 09:00 Asia/Kolkata (UTC+5:30, no DST) is 03:30 UTC.
+    const next = new Date(task.next_run);
+    expect(next.getUTCHours()).toBe(3);
+    expect(next.getUTCMinutes()).toBe(30);
+  });
 
   it("persists task identity from the source namespace", async () => {
     await execute({

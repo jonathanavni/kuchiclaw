@@ -12,7 +12,7 @@ import type { ContainerTerminationUnknownError } from "./container-errors.js";
 import { ensureGroupFolder } from "./group-folder.js";
 import { insertMessage, updateMessageStatus, getRecentMessages, formatHistory } from "./db.js";
 import { getSecrets, getSkillSecrets } from "./auth.js";
-import { selectModels } from "./config.js";
+import { AGENT_TIMEZONE, formatAgentTime, selectModels } from "./config.js";
 import { isValidGroupName } from "./ipc-auth.js";
 import type { ContainerInput } from "./types.js";
 
@@ -101,6 +101,8 @@ export async function main() {
     groupFolder: group,
     secrets: { ...getSkillSecrets(group), ...authSecrets },
     messageHistory: messageHistory || undefined,
+    currentTime: formatAgentTime(),
+    timezone: AGENT_TIMEZONE,
     model,
     fallbackModel,
   };

@@ -130,6 +130,35 @@ export function selectModels(
     : { model, fallbackModel: AGENT_FALLBACK_MODEL };
 }
 
+/** IANA timezone for the agent's session context AND cron interpretation.
+ *  Default UTC preserves pre-P5 behavior until the operator opts in via .env.
+ *  Cron and display must share one zone — advertising a local zone while
+ *  parsing cron in UTC is the wrong-hour regression P5.2 exists to prevent. */
+export const AGENT_TIMEZONE = parseTimezoneEnv("AGENT_TIMEZONE", "UTC");
+
+/** Human-readable "now" in AGENT_TIMEZONE for the container session context. */
+export function formatAgentTime(date = new Date()): string {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: AGENT_TIMEZONE,
+    weekday: "short",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+    timeZoneName: "shortOffset",
+  }).formatToParts(date);
+  const p = Object.fromEntries(parts.map((x) => [x.type, x.value]));
+  return `${p.weekday} ${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}:${p.second} ${p.timeZoneName}`;
+}
+
+/** Injected message history budgets (chars, not bytes — applied pre-serialization). */
+export const HISTORY_MESSAGE_MAX_CHARS = 2000;
+export const HISTORY_TOTAL_MAX_CHARS = 16_000;
+export const HISTORY_SENDER_NAME_MAX_CHARS = 64;
+
 /** Channel-qualified chat ID that maps to the "main" group (e.g., "tg-123456789"). */
 export const MAIN_CHAT_ID = process.env.MAIN_CHAT_ID ?? "";
 
@@ -138,6 +167,19 @@ export const MAIN_CHAT_ID = process.env.MAIN_CHAT_ID ?? "";
 export const ALLOWED_SENDER_IDS: string[] = process.env.ALLOWED_SENDER_IDS
   ? process.env.ALLOWED_SENDER_IDS.split(",").map((s) => s.trim()).filter(Boolean)
   : [];
+
+function parseTimezoneEnv(name: string, fallback: string): string {
+  const configured = process.env[name]?.trim();
+  if (!configured) return fallback;
+  try {
+    // Intl throws RangeError on any non-IANA zone name — the validation itself.
+    new Intl.DateTimeFormat("en-US", { timeZone: configured });
+    return configured;
+  } catch {
+    console.warn(`[Config] Invalid ${name}=${JSON.stringify(configured)}; using default ${fallback}`);
+    return fallback;
+  }
+}
 
 function parsePortEnv(name: string, fallback: number): number {
   const configured = process.env[name];

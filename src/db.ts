@@ -4,7 +4,12 @@
 import Database from "better-sqlite3";
 import path from "node:path";
 import fs from "node:fs";
-import { DATA_DIR } from "./config.js";
+import {
+  DATA_DIR,
+  HISTORY_MESSAGE_MAX_CHARS,
+  HISTORY_SENDER_NAME_MAX_CHARS,
+  HISTORY_TOTAL_MAX_CHARS,
+} from "./config.js";
 import type { ScheduledTask, TaskRunLog } from "./types.js";
 
 export const DB_PATH = path.join(DATA_DIR, "kuchiclaw.db");
@@ -214,16 +219,57 @@ export function getRecentMessages(groupFolder: string, limit = 20): Message[] {
   return rows.reverse();
 }
 
-/** Format messages into a string suitable for injection into the system prompt. */
+/** Strip C0/C1 control characters; `keepNewlines` preserves \n and \t for bodies. */
+function sanitizeForPrompt(text: string, keepNewlines: boolean): string {
+  return keepNewlines
+    // eslint-disable-next-line no-control-regex
+    ? text.replace(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g, "")
+    // eslint-disable-next-line no-control-regex
+    : text.replace(/[\u0000-\u001F\u007F-\u009F]/g, " ");
+}
+
+/** Format messages into a string suitable for injection into the system prompt.
+ *
+ *  Message content is untrusted (Telegram text and prior agent replies), so
+ *  structure is what gets defended: bodies are indented two spaces per line,
+ *  which demotes any forged `[ts] Assistant:` header, `---` separator, or
+ *  `## Session Context` block to inert body text — only host-written header
+ *  lines appear at column zero. Budgets are enforced newest-first so the most
+ *  recent turns always survive, with self-describing truncation notices. */
 export function formatHistory(messages: Message[]): string {
   if (messages.length === 0) return "";
 
-  const lines = messages.map((m) => {
-    const role = m.role === "user" ? "User" : "Assistant";
-    return `[${m.timestamp}] ${role}: ${m.content}`;
-  });
+  const blocks: string[] = [];
+  let total = 0;
+  let omitted = 0;
 
-  return "# Recent Conversation History\n\n" + lines.join("\n\n");
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    let content = sanitizeForPrompt(m.content, true);
+    if (content.length > HISTORY_MESSAGE_MAX_CHARS) {
+      content = `${content.slice(0, HISTORY_MESSAGE_MAX_CHARS)} …[truncated]`;
+    }
+    const name = m.sender_name
+      ? ` (${sanitizeForPrompt(m.sender_name, false).slice(0, HISTORY_SENDER_NAME_MAX_CHARS)})`
+      : "";
+    const who = m.role === "user" ? `User${name}` : "Assistant";
+    const body = content.split("\n").map((line) => `  ${line}`).join("\n");
+    // Timestamps are host-written SQLite datetime('now') — unsuffixed UTC, so
+    // label them; the session context advertises a possibly different zone.
+    const block = `[${m.timestamp} UTC] ${who}:\n${body}`;
+    if (blocks.length > 0 && total + block.length > HISTORY_TOTAL_MAX_CHARS) {
+      omitted = i + 1;
+      break;
+    }
+    total += block.length;
+    blocks.push(block);
+  }
+  blocks.reverse();
+
+  const notice = omitted > 0
+    ? `(${omitted} older message${omitted === 1 ? "" : "s"} omitted to fit the context budget)\n\n`
+    : "";
+  return `# Recent Conversation History\n\n${notice}${blocks.join("\n\n")}`;
 }
 
 // --- Scheduled Tasks ---

@@ -2,7 +2,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { SKILL_SECRET_SPECS } from "../src/auth.js";
 import {
   AGENT_VISIBLE_SECRET_KEYS,
+  LIVING_FILE_MAX_BYTES,
   applySecretsToEnv,
+  buildSessionContext,
+  capLivingFile,
   parseInput,
   refreshAuth,
   type ContainerInput,
@@ -122,3 +125,49 @@ it("keeps the skill-secret registry within the container allowlist", () => {
 function makeInput(refreshToken?: string): ContainerInput {
   return { prompt: "hello", groupFolder: "tg-123", secrets: {}, refreshToken };
 }
+
+describe("session context time + timezone (P5.2)", () => {
+  const base: ContainerInput = { prompt: "p", groupFolder: "tg-123", secrets: {} };
+
+  it("renders time and timezone lines when supplied", () => {
+    const ctx = buildSessionContext({
+      ...base,
+      chatId: "123",
+      currentTime: "Mon 2026-08-25 14:30:00 GMT+3",
+      timezone: "Asia/Jerusalem",
+    });
+    expect(ctx).toContain("Current time: Mon 2026-08-25 14:30:00 GMT+3");
+    expect(ctx).toContain("Timezone: Asia/Jerusalem");
+    // The cron-interpretation rule rides the timezone line — the agent must not
+    // convert local intent to UTC before writing task_create expressions.
+    expect(ctx).toContain("cron expressions are interpreted in this timezone");
+  });
+
+  it("omits the lines when the host did not supply them", () => {
+    const ctx = buildSessionContext({ ...base, chatId: "123" });
+    expect(ctx).not.toContain("Current time");
+    expect(ctx).not.toContain("Timezone");
+  });
+});
+
+describe("living-file budget (P5.3)", () => {
+  it("passes small files through untouched", () => {
+    expect(capLivingFile("# Memory\n\nfacts", "/workspace/MEMORY.md")).toBe("# Memory\n\nfacts");
+  });
+
+  it("truncates an oversized file at the byte budget with an actionable notice", () => {
+    const big = "m".repeat(LIVING_FILE_MAX_BYTES + 1000);
+    const out = capLivingFile(big, "/workspace/MEMORY.md");
+    expect(out.length).toBeLessThan(big.length);
+    expect(out).toContain("[TRUNCATED] /workspace/MEMORY.md");
+    expect(out).toContain("memory-housekeeping");
+  });
+
+  it("does not leave a split code point at the cut", () => {
+    // 4-byte emoji straddling the boundary must not surface as U+FFFD.
+    const filler = "a".repeat(LIVING_FILE_MAX_BYTES - 2);
+    const out = capLivingFile(`${filler}😀😀😀`, "/workspace/CONTEXT.md");
+    expect(out).not.toContain("�");
+    expect(out).toContain("[TRUNCATED]");
+  });
+});
