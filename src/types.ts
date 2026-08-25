@@ -23,12 +23,19 @@ export interface ContainerInput {
   systemPrompt?: string;
   /** Recent message history formatted for injection into the prompt */
   messageHistory?: string;
+  /** Human-readable "now" in the agent's timezone, computed host-side at spawn */
+  currentTime?: string;
+  /** IANA timezone that governs both display and cron interpretation */
+  timezone?: string;
   /** MCP server configs to pass to the SDK */
   mcpServers?: Record<string, McpServerConfig>;
   /** Model for the SDK query — unset lets the SDK pick its default */
   model?: string;
   /** Model the SDK falls back to when `model` is capacity-limited (e.g. the Opus weekly cap) */
   fallbackModel?: string;
+  /** Per-run HMAC key (hex) the container signs its result file with. Host-generated,
+   *  scrubbed from `input` before any agent code runs, never placed in env. */
+  outputKey?: string;
 }
 
 /** IPC request written by the container to the mounted IPC directory */
@@ -80,11 +87,10 @@ export interface TaskRunLog {
   error: string | null;
 }
 
-/** Output received from the container via stdout sentinel markers */
+/** Output received from the container via the HMAC-signed result file */
 export interface ContainerOutput {
   status: "success" | "error";
   result?: string;
-  newSessionId?: string;
   error?: string;
   /** Refused secret names surfaced to the host even when the run succeeds. */
   warnings?: string[];

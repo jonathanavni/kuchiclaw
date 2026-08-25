@@ -41,4 +41,10 @@ RUN mkdir -p /workspace && chown agent:agent /workspace
 
 USER agent
 
-CMD ["npx", "tsx", "entrypoint.ts"]
+# --disable-sigusr1 closes the inspector-activation channel: the agent shares
+# this process's uid and could otherwise send SIGUSR1 to start a debugger,
+# connect over container loopback, and read the per-run result-signing key from
+# the entrypoint's heap (Yama gates ptrace, not SIGUSR1). `--import tsx` runs
+# the TS entrypoint IN this flagged process — no child that would escape it; the
+# SDK's own child processes never hold the key, so they don't need the flag.
+CMD ["node", "--disable-sigusr1", "--import", "tsx", "entrypoint.ts"]

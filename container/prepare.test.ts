@@ -1,12 +1,22 @@
+import { createHmac } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SKILL_SECRET_SPECS } from "../src/auth.js";
 import {
   AGENT_VISIBLE_SECRET_KEYS,
+  CONTAINER_OUTPUT_DIR,
+  LIVING_FILE_MAX_BYTES,
+  RESULT_ENVELOPE_VERSION,
+  RESULT_FILENAME,
+  RESULT_TMP_FILENAME,
   applySecretsToEnv,
+  buildSessionContext,
+  capLivingFile,
   parseInput,
   refreshAuth,
+  signEnvelope,
   type ContainerInput,
 } from "./prepare.js";
+import * as hostConfig from "../src/config.js";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -122,3 +132,71 @@ it("keeps the skill-secret registry within the container allowlist", () => {
 function makeInput(refreshToken?: string): ContainerInput {
   return { prompt: "hello", groupFolder: "tg-123", secrets: {}, refreshToken };
 }
+
+describe("session context time + timezone (P5.2)", () => {
+  const base: ContainerInput = { prompt: "p", groupFolder: "tg-123", secrets: {} };
+
+  it("renders time and timezone lines when supplied", () => {
+    const ctx = buildSessionContext({
+      ...base,
+      chatId: "123",
+      currentTime: "Mon 2026-08-25 14:30:00 GMT+3",
+      timezone: "Asia/Jerusalem",
+    });
+    expect(ctx).toContain("Current time: Mon 2026-08-25 14:30:00 GMT+3");
+    expect(ctx).toContain("Timezone: Asia/Jerusalem");
+    // The cron-interpretation rule rides the timezone line — the agent must not
+    // convert local intent to UTC before writing task_create expressions.
+    expect(ctx).toContain("cron expressions are interpreted in this timezone");
+  });
+
+  it("omits the lines when the host did not supply them", () => {
+    const ctx = buildSessionContext({ ...base, chatId: "123" });
+    expect(ctx).not.toContain("Current time");
+    expect(ctx).not.toContain("Timezone");
+  });
+});
+
+describe("living-file budget (P5.3)", () => {
+  it("passes small files through untouched", () => {
+    expect(capLivingFile("# Memory\n\nfacts", "/workspace/MEMORY.md")).toBe("# Memory\n\nfacts");
+  });
+
+  it("truncates an oversized file within the byte budget, notice included (Codex F2)", () => {
+    const big = "m".repeat(LIVING_FILE_MAX_BYTES + 1000);
+    const out = capLivingFile(big, "/workspace/MEMORY.md");
+    // The notice's own bytes must be reserved — the returned value never exceeds
+    // the budget (the old impl appended the notice AFTER taking the full cap).
+    expect(Buffer.byteLength(out, "utf8")).toBeLessThanOrEqual(LIVING_FILE_MAX_BYTES);
+    expect(out).toContain("[TRUNCATED] /workspace/MEMORY.md");
+    expect(out).toContain("memory-housekeeping");
+  });
+
+  it("does not leave a split code point at the cut", () => {
+    // 4-byte emoji straddling the boundary must not surface as U+FFFD.
+    const filler = "a".repeat(LIVING_FILE_MAX_BYTES - 2);
+    const out = capLivingFile(`${filler}😀😀😀`, "/workspace/CONTEXT.md");
+    expect(out).not.toContain("�");
+    expect(out).toContain("[TRUNCATED]");
+  });
+});
+
+describe("result-transport parity with host config (P5.1)", () => {
+  it("keeps the envelope constants byte-identical across the boundary", () => {
+    expect(RESULT_FILENAME).toBe(hostConfig.RESULT_FILENAME);
+    expect(RESULT_TMP_FILENAME).toBe(hostConfig.RESULT_TMP_FILENAME);
+    expect(RESULT_ENVELOPE_VERSION).toBe(hostConfig.RESULT_ENVELOPE_VERSION);
+    expect(CONTAINER_OUTPUT_DIR).toBe(hostConfig.CONTAINER_OUTPUT_DIR);
+  });
+
+  it("signEnvelope produces a host-verifiable HMAC envelope", () => {
+    const key = "cd".repeat(32);
+    const envelope = JSON.parse(signEnvelope({ status: "success", result: "hi" }, key));
+    expect(envelope.v).toBe(RESULT_ENVELOPE_VERSION);
+    expect(JSON.parse(envelope.payload)).toEqual({ status: "success", result: "hi" });
+    // Same key + payload must reproduce the digest (host verification path).
+    const expected = createHmac("sha256", Buffer.from(key, "hex"))
+      .update(envelope.payload, "utf8").digest("hex");
+    expect(envelope.hmac).toBe(expected);
+  });
+});

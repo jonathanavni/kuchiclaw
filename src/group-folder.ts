@@ -25,6 +25,8 @@ export interface GroupPaths {
   skills: string;
   /** Global HEARTBEAT.md (read-only, self-maintenance checklist) */
   heartbeat: string;
+  /** Parent of per-run result directories — host-owned, never mounted itself */
+  outRoot: string;
 }
 
 /** Ensure a group folder exists with all required files, return paths. */
@@ -45,15 +47,19 @@ export function ensureGroupFolder(groupName: string): GroupPaths {
     ipc,
     skills: SKILLS_DIR,
     heartbeat: path.join(PROJECT_ROOT, "HEARTBEAT.md"),
+    outRoot: path.join(root, "out"),
   };
 
   assertRealDirectoryIfPresent(root, "group");
   assertRealDirectoryIfPresent(ipc, "IPC namespace");
+  assertRealDirectoryIfPresent(paths.outRoot, "output root");
 
   fs.mkdirSync(paths.logs, { recursive: true });
   fs.mkdirSync(ipc, { recursive: true });
+  fs.mkdirSync(paths.outRoot, { recursive: true });
   assertRealDirectoryIfPresent(root, "group");
   assertRealDirectoryIfPresent(ipc, "IPC namespace");
+  assertRealDirectoryIfPresent(paths.outRoot, "output root");
 
   // Seed MEMORY.md if it doesn't exist
   if (!fs.existsSync(paths.memory)) {

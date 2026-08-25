@@ -8,6 +8,7 @@ import {
   MAX_REQUEST_BYTES,
   MAX_REQUESTS_PER_NAMESPACE,
 } from "./config.js";
+import { readBoundedFile } from "./bounded-read.js";
 import { isValidGroupName } from "./ipc-auth.js";
 import { execute } from "./ipc.js";
 import type { IpcRequest } from "./types.js";
@@ -162,28 +163,8 @@ async function pollNamespace(
   }
 }
 
-/** Read through one descriptor so metadata checks and bytes refer to one object. */
 export function readRequestFile(filePath: string): string {
-  const flags = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK;
-  const fd = fs.openSync(filePath, flags);
-  try {
-    const stat = fs.fstatSync(fd);
-    if (!stat.isFile()) throw new Error("IPC request is not a regular file");
-    if (stat.nlink !== 1) throw new Error("IPC request must have exactly one hard link");
-    if (stat.size > MAX_REQUEST_BYTES) throw new Error("IPC request exceeds size limit");
-
-    const buffer = Buffer.alloc(MAX_REQUEST_BYTES + 1);
-    let total = 0;
-    while (total < buffer.length) {
-      const bytesRead = fs.readSync(fd, buffer, total, buffer.length - total, null);
-      if (bytesRead === 0) break;
-      total += bytesRead;
-    }
-    if (total > MAX_REQUEST_BYTES) throw new Error("IPC request exceeds size limit");
-    return buffer.subarray(0, total).toString("utf8");
-  } finally {
-    fs.closeSync(fd);
-  }
+  return readBoundedFile(filePath, MAX_REQUEST_BYTES, "IPC request");
 }
 
 export function quarantineLooseRootRequests(

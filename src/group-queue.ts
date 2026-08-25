@@ -3,17 +3,19 @@
 // Jobs within a group execute in FIFO order; across groups, concurrently.
 
 import { runContainer, type ContainerLifecycle } from "./container-runner.js";
-import { ContainerTerminationUnknownError } from "./container-errors.js";
+import { ContainerTerminationUnknownError, OutputVerificationError } from "./container-errors.js";
 import { ensureGroupFolder } from "./group-folder.js";
 import { getSecrets, getSkillSecrets } from "./auth.js";
 import { getRefreshToken } from "./oauth-refresh.js";
 import { insertMessage, getRecentMessages, formatHistory, updateMessageStatus } from "./db.js";
 import {
+  AGENT_TIMEZONE,
   MAX_CONTAINERS_PER_GROUP,
   MAX_RETRIES,
   BASE_RETRY_MS,
   DELIVERY_MAX_RETRIES,
   DELIVERY_BASE_MS,
+  formatAgentTime,
   selectModels,
 } from "./config.js";
 import { assertDestinationAllowed } from "./ipc-auth.js";
@@ -191,6 +193,8 @@ async function executeJob(job: Job): Promise<void> {
     // stale oauth.json lineage clobber the grant — the exact crash-loop P4.1 removes.
     refreshToken: source === "oauth-json" ? getRefreshToken() ?? undefined : undefined,
     messageHistory: messageHistory || undefined,
+    currentTime: formatAgentTime(),
+    timezone: AGENT_TIMEZONE,
     mcpServers: job.mcpServers,
     model,
     fallbackModel,
@@ -213,6 +217,17 @@ async function executeJob(job: Job): Promise<void> {
     if (err instanceof ContainerTerminationUnknownError) {
       if (job.messageId) updateMessageStatus(job.messageId, "failed");
       await deliver(channel, chatId, `Container containment error: ${errMsg}`);
+      job.onError?.(errMsg);
+      return;
+    }
+
+    // The container ran but produced no verifiable result. Non-retryable: a
+    // re-run would repeat any side effects the agent already performed (an IPC
+    // send/task is executed by the host independently of the result), and only
+    // a pre-start failure (spawn/stdin) is safe to retry.
+    if (err instanceof OutputVerificationError) {
+      if (job.messageId) updateMessageStatus(job.messageId, "failed");
+      await deliver(channel, chatId, `Container produced no valid result: ${errMsg}`);
       job.onError?.(errMsg);
       return;
     }

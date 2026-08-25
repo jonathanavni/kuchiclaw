@@ -95,3 +95,38 @@ describe("one-shot tasks", () => {
     expect(all[0].status).toBe("completed");
   });
 });
+
+// P5.2 (Codex F5): cron-parser's Asia/Jerusalem DST behavior is pinned here so a
+// cron-parser upgrade that changes it is caught. These are the ACCEPTED policy:
+// a spring-forward day can skip a firing; a fall-back ambiguous time fires once.
+describe("cron DST policy under a real timezone (P5.2)", () => {
+  const tz = "Asia/Jerusalem"; // 2026: spring 03-27 02:00→03:00, fall 10-25 02:00→01:00
+
+  it("skips the spring-forward day for a 03:00 daily task", () => {
+    const it = CronExpressionParser.parse("0 3 * * *", {
+      currentDate: new Date("2026-03-26T00:00:00Z"),
+      tz,
+    });
+    const fires = [it.next().toDate().toISOString(), it.next().toDate().toISOString()];
+    // 03:00 IST on 03-26, then 03:00 IDT on 03-28 — 2026-03-27 is skipped.
+    expect(fires).toEqual(["2026-03-26T01:00:00.000Z", "2026-03-28T00:00:00.000Z"]);
+  });
+
+  it("fires an ambiguous fall-back time exactly once", () => {
+    const it = CronExpressionParser.parse("30 1 * * *", {
+      currentDate: new Date("2026-10-24T00:00:00Z"),
+      tz,
+    });
+    const fires = [
+      it.next().toDate().toISOString(),
+      it.next().toDate().toISOString(),
+      it.next().toDate().toISOString(),
+    ];
+    // 01:30 occurs twice on 10-25 (IDT then IST); only the second instant fires.
+    expect(fires).toEqual([
+      "2026-10-24T22:30:00.000Z",
+      "2026-10-25T23:30:00.000Z",
+      "2026-10-26T23:30:00.000Z",
+    ]);
+  });
+});

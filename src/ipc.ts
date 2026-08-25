@@ -1,4 +1,5 @@
 import { CronExpressionParser } from "cron-parser";
+import { AGENT_TIMEZONE } from "./config.js";
 import { assertDestinationAllowed } from "./ipc-auth.js";
 import { getTaskById, getTasksByGroup, insertTask, updateTaskStatus } from "./db.js";
 import type { IpcRequest } from "./types.js";
@@ -56,7 +57,7 @@ async function handleTaskCreate(req: IpcRequest, sourceGroup: string): Promise<v
 
   let nextRun: string;
   if (req.scheduleType === "cron") {
-    nextRun = CronExpressionParser.parse(req.scheduleValue, { tz: "UTC" })
+    nextRun = CronExpressionParser.parse(req.scheduleValue, { tz: AGENT_TIMEZONE })
       .next().toDate().toISOString();
   } else if (req.scheduleType === "interval") {
     const ms = Number(req.scheduleValue);

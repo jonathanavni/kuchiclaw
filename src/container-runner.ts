@@ -1,22 +1,34 @@
 // Spawns one ephemeral Docker container and owns its complete attach lifecycle.
 
-import { randomBytes } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
 import {
   CONTAINER_CPUS,
   CONTAINER_IMAGE,
   CONTAINER_MEMORY,
+  CONTAINER_OUTPUT_DIR,
   CONTAINER_PIDS_LIMIT,
   CONTAINER_TIMEOUT_MS,
-  OUTPUT_END_MARKER,
-  OUTPUT_START_MARKER,
+  MAX_DIAGNOSTIC_BYTES,
+  MAX_OUTPUT_BYTES,
+  RESULT_ENVELOPE_VERSION,
+  RESULT_FILENAME,
   TERMINATION_DRAIN_MS,
 } from "./config.js";
-import { ContainerTerminationUnknownError } from "./container-errors.js";
+import { ContainerTerminationUnknownError, OutputVerificationError } from "./container-errors.js";
 import { execDocker, spawnDocker, type DockerExecResult } from "./docker.js";
+import { readBoundedFile } from "./bounded-read.js";
 import { updateOAuthData } from "./oauth-refresh.js";
 import type { GroupPaths } from "./group-folder.js";
 import type { ContainerInput, ContainerOutput } from "./types.js";
+
+/** Result of reading the signed result file. `invalid` is tamper/corruption
+ *  (non-retryable); `missing` is no file at all (the container never emitted). */
+type SignedRead =
+  | { kind: "ok"; output: ContainerOutput }
+  | { kind: "missing" }
+  | { kind: "invalid"; reason: string };
 
 export interface ContainerLifecycle {
   owner: "orchestrator" | "cli";
@@ -30,11 +42,24 @@ const MAX_CONTAINER_WARNING_LENGTH = 200;
 
 export async function runContainer(
   input: ContainerInput,
-  paths: GroupPaths | undefined,
+  paths: GroupPaths,
   lifecycle: ContainerLifecycle,
 ): Promise<ContainerOutput> {
   const containerName = `kuchiclaw-${input.groupFolder}-${Date.now()}-${randomBytes(4).toString("hex")}`;
-  const mounts = paths ? buildMountArgs(paths) : [];
+  // Per-run signing key + per-run output dir. Two same-group containers run
+  // concurrently (MAX_CONTAINERS_PER_GROUP), so the dir must be per-run.
+  const outputKey = randomBytes(32).toString("hex");
+  const runDir = path.join(paths.outRoot, containerName);
+  fs.mkdirSync(runDir, { recursive: true });
+  const signedInput: ContainerInput = { ...input, outputKey };
+
+  let mounts: string[];
+  try {
+    mounts = buildMountArgs(paths, runDir);
+  } catch (err) {
+    cleanupRunDir(runDir); // a pre-spawn mount-source failure must not leak the dir
+    throw err;
+  }
   const args = [
     "run", "-i", "--rm", "--name", containerName,
     "--label", `kuchiclaw.owner=${lifecycle.owner}`,
@@ -47,8 +72,8 @@ export async function runContainer(
   return new Promise<ContainerOutput>((resolve, reject) => {
     const proc = spawnDocker(args, { stdio: ["pipe", "pipe", "pipe"] });
     let state: RunnerState = "running";
-    let stdout = "";
-    let stderr = "";
+    const stdout = boundedBuffer();
+    const stderr = boundedBuffer();
     let closeRecorded = false;
     let closeCode: number | null = null;
     let signalClose!: () => void;
@@ -58,7 +83,7 @@ export async function runContainer(
       if (state === "settled") return;
       state = "settled";
       clearTimeout(timeout);
-      fn();
+      try { fn(); } finally { cleanupRunDir(runDir); }
     };
 
     const timeout = setTimeout(() => {
@@ -67,8 +92,8 @@ export async function runContainer(
       void finalizeTermination();
     }, CONTAINER_TIMEOUT_MS);
 
-    proc.stdout?.on("data", (chunk: Buffer | string) => { stdout += chunk.toString(); });
-    proc.stderr?.on("data", (chunk: Buffer | string) => { stderr += chunk.toString(); });
+    proc.stdout?.on("data", (chunk: Buffer | string) => { stdout.push(chunk.toString()); });
+    proc.stderr?.on("data", (chunk: Buffer | string) => { stderr.push(chunk.toString()); });
 
     proc.on("error", (err) => {
       if (state === "running") {
@@ -84,26 +109,42 @@ export async function runContainer(
       if (state === "running") finalizeNormalClose();
     });
 
-    proc.stdin?.on("error", () => {
-      // Docker's close/error events carry the authoritative spawn/run outcome.
-    });
+    // Node requires an 'error' listener on the stream, but a stdin error is NOT
+    // reliable proof the agent didn't run — it can fire late during teardown
+    // after a full run — so it never influences retry classification. Any
+    // container-started outcome without a verifiable result stays non-retryable.
+    proc.stdin?.on("error", () => { /* outcome comes from the result file + close/timeout */ });
     try {
-      proc.stdin?.write(JSON.stringify(input));
+      proc.stdin?.write(JSON.stringify(signedInput));
       proc.stdin?.end();
     } catch (err) {
-      settle(() => reject(new Error(`Failed to write container input: ${formatError(err)}`)));
+      // A synchronous throw leaves a spawned container that may hang on an EOF we
+      // never sent; route through termination to kill+confirm it (no stray, no
+      // concurrent retry onto its live mounts) instead of settling it out from
+      // under it. The outcome is the normal non-retryable no-result adjudication.
+      console.error(`[Container] Input delivery failed: ${formatError(err)}`);
+      if (state === "running") {
+        state = "terminating";
+        void finalizeTermination();
+      }
     }
 
     function finalizeNormalClose(): void {
       try {
-        const output = parseOutput(stdout);
-        if (output) {
-          logWarnings(output);
-          persistNewTokens(output);
-          settle(() => resolve(output));
+        const read = readSignedResult(runDir, outputKey);
+        if (read.kind === "ok") {
+          // readSignedResult never throws and persistNewTokens self-catches, so
+          // this success bookkeeping can't fall into the retryable catch below.
+          logWarnings(read.output);
+          persistNewTokens(read.output);
+          settle(() => resolve(read.output));
           return;
         }
-        settle(() => reject(invalidOutputError(closeCode, stdout, stderr)));
+        // The container ran (it closed cleanly), so a missing or tampered result
+        // is non-retryable: a re-run would repeat any side effects the agent
+        // already performed. Only a failure to spawn at all (proc 'error') is
+        // retryable.
+        settle(() => reject(outputFailure(read, closeCode, stdout.get(), stderr.get())));
       } catch (err) {
         settle(() => reject(new Error(`Container output handling failed: ${formatError(err)}`)));
       }
@@ -125,7 +166,11 @@ export async function runContainer(
         ]);
         terminationAdjudicated = true;
         deathConfirmed = termination.confirmed;
-        output = parseOutput(stdout);
+        // A file survives SIGKILL, so it's read after the drain — no stdout race.
+        // HMAC makes reading during unconfirmed death forgery-safe: a valid
+        // envelope could only have been signed by the entrypoint.
+        const read = readSignedResult(runDir, outputKey);
+        output = read.kind === "ok" ? read.output : null;
         if (output) {
           logWarnings(output);
           persistNewTokens(output);
@@ -137,7 +182,11 @@ export async function runContainer(
           );
           if (!output) rejection = containment;
         } else if (!output) {
-          rejection = new Error(`Container timed out after ${CONTAINER_TIMEOUT_MS}ms`);
+          // Container ran to its timeout without a valid result — non-retryable
+          // (it may have side-effected); a bare timeout with no file included.
+          rejection = read.kind === "invalid"
+            ? new OutputVerificationError(`Container ${containerName} produced an invalid result: ${read.reason}`)
+            : new OutputVerificationError(`Container ${containerName} timed out after ${CONTAINER_TIMEOUT_MS}ms with no result`);
         }
       } catch (err) {
         containment = new ContainerTerminationUnknownError(
@@ -147,7 +196,7 @@ export async function runContainer(
       } finally {
         if (!terminationAdjudicated) deathConfirmed = false;
         if (output) settle(() => resolve(output!));
-        else settle(() => reject(rejection ?? new Error(`Container timed out after ${CONTAINER_TIMEOUT_MS}ms`)));
+        else settle(() => reject(rejection ?? new OutputVerificationError(`Container timed out after ${CONTAINER_TIMEOUT_MS}ms with no result`)));
 
         if (!deathConfirmed) {
           containment ??= new ContainerTerminationUnknownError(
@@ -184,7 +233,7 @@ export async function runContainer(
   });
 }
 
-function buildMountArgs(paths: GroupPaths): string[] {
+function buildMountArgs(paths: GroupPaths, runDir: string): string[] {
   const mounts: Array<[string, string, boolean]> = [
     [paths.soul, "/workspace/SOUL.md", true],
     [paths.tools, "/workspace/TOOLS.md", true],
@@ -192,6 +241,7 @@ function buildMountArgs(paths: GroupPaths): string[] {
     [paths.context, "/workspace/CONTEXT.md", false],
     [paths.ipc, "/workspace/ipc", false],
     [paths.skills, "/workspace/skills", true],
+    [runDir, CONTAINER_OUTPUT_DIR, false],
   ];
   if (assertMountSource(paths.heartbeat, true)) {
     mounts.push([paths.heartbeat, "/workspace/HEARTBEAT.md", true]);
@@ -293,28 +343,72 @@ function sanitizeWarning(warning: string): string {
     .replace(/[\x00-\x1F\x7F]/g, " ");
 }
 
-function invalidOutputError(code: number | null, stdout: string, stderr: string): Error {
-  return new Error(
-    `Container exited with code ${code}. No valid output found.\n` +
+/** Turn a non-ok signed read into the OutputVerificationError the queue treats
+ *  as non-retryable, folding in bounded stdout/stderr for diagnostics. */
+function outputFailure(read: SignedRead, code: number | null, stdout: string, stderr: string): Error {
+  const detail = read.kind === "invalid" ? `invalid result (${read.reason})` : "no result file";
+  return new OutputVerificationError(
+    `Container exited with code ${code}: ${detail}.\n` +
     `stderr: ${stderr.slice(0, 500)}\nstdout: ${stdout.slice(0, 500)}`,
   );
 }
 
-/** Extract and minimally validate JSON between sentinel markers. */
-function parseOutput(stdout: string): ContainerOutput | null {
-  const startIdx = stdout.indexOf(OUTPUT_START_MARKER);
-  if (startIdx === -1) return null;
-  const endIdx = stdout.indexOf(OUTPUT_END_MARKER, startIdx + OUTPUT_START_MARKER.length);
-  if (endIdx === -1) return null;
+/** Read and verify the container's signed result file. Never throws for an
+ *  expected condition (missing, symlinked, oversized, tampered) — those become
+ *  a discriminated result so the finalizer's no-throw invariant holds. */
+export function readSignedResult(runDir: string, outputKey: string): SignedRead {
+  const file = path.join(runDir, RESULT_FILENAME);
+  let raw: string;
   try {
-    const parsed = JSON.parse(
-      stdout.slice(startIdx + OUTPUT_START_MARKER.length, endIdx).trim(),
-    ) as unknown;
-    if (!parsed || typeof parsed !== "object") return null;
-    const status = (parsed as { status?: unknown }).status;
-    return status === "success" || status === "error" ? parsed as ContainerOutput : null;
-  } catch {
-    return null;
+    raw = readBoundedFile(file, MAX_OUTPUT_BYTES, "container result");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { kind: "missing" };
+    // ELOOP (symlink under O_NOFOLLOW), size cap, nlink≠1, non-regular → tamper.
+    return { kind: "invalid", reason: formatError(err) };
+  }
+
+  let envelope: unknown;
+  try { envelope = JSON.parse(raw); } catch { return { kind: "invalid", reason: "result is not JSON" }; }
+  if (!envelope || typeof envelope !== "object") return { kind: "invalid", reason: "envelope is not an object" };
+  const { v, hmac, payload } = envelope as Record<string, unknown>;
+  if (v !== RESULT_ENVELOPE_VERSION) return { kind: "invalid", reason: `unexpected envelope version ${String(v)}` };
+  if (typeof hmac !== "string" || typeof payload !== "string") return { kind: "invalid", reason: "malformed envelope" };
+
+  const expected = createHmac("sha256", Buffer.from(outputKey, "hex")).update(payload, "utf8").digest();
+  const provided = Buffer.from(hmac, "hex");
+  if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) {
+    return { kind: "invalid", reason: "HMAC verification failed" };
+  }
+
+  let output: unknown;
+  try { output = JSON.parse(payload); } catch { return { kind: "invalid", reason: "payload is not JSON" }; }
+  if (!output || typeof output !== "object") return { kind: "invalid", reason: "payload is not an object" };
+  const status = (output as { status?: unknown }).status;
+  if (status !== "success" && status !== "error") return { kind: "invalid", reason: "payload has no valid status" };
+  return { kind: "ok", output: output as ContainerOutput };
+}
+
+/** Bounded diagnostic collector: retains only the last MAX_DIAGNOSTIC_BYTES so a
+ *  stream-flooding agent can't grow orchestrator memory without bound. */
+function boundedBuffer(cap = MAX_DIAGNOSTIC_BYTES): { push: (s: string) => void; get: () => string } {
+  let buf = "";
+  return {
+    push(s: string) {
+      buf += s;
+      // Amortize the slice: only trim once we're at 2× the cap.
+      if (buf.length > cap * 2) buf = buf.slice(buf.length - cap);
+    },
+    get() {
+      return buf.length > cap ? buf.slice(buf.length - cap) : buf;
+    },
+  };
+}
+
+function cleanupRunDir(runDir: string): void {
+  try {
+    fs.rmSync(runDir, { recursive: true, force: true });
+  } catch (err) {
+    console.error(`[Container] Failed to clean run dir ${runDir}: ${formatError(err)}`);
   }
 }
 
