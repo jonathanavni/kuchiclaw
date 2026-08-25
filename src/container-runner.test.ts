@@ -72,6 +72,7 @@ beforeEach(() => {
   docker.execDocker.mockResolvedValue(ok);
   vi.spyOn(console, "error").mockImplementation(() => {});
   vi.spyOn(console, "log").mockImplementation(() => {});
+  vi.spyOn(console, "warn").mockImplementation(() => {});
 });
 
 afterEach(() => {
@@ -199,13 +200,19 @@ describe("runContainer timeout state machine — D2 matrix", () => {
   it("output-before-timeout is success and persists newTokens exactly once", async () => {
     const newTokens = { accessToken: "a", refreshToken: "r", expiresAt: 123 };
     const tracked = track(runContainer(input(), undefined, { owner: "orchestrator" }));
-    proc.stdout.emit("data", output({ newTokens }));
+    proc.stdout.emit("data", output({
+      newTokens,
+      warnings: ["refused secret key: TIMEOUT_SECRET"],
+    }));
     await fireTimeout();
     proc.emit("close", 137);
 
     await expect(tracked.promise).resolves.toMatchObject({ result: "done", newTokens });
     expect(updateOAuthData).toHaveBeenCalledOnce();
     expect(updateOAuthData).toHaveBeenCalledWith(newTokens);
+    expect(console.warn).toHaveBeenCalledWith(
+      "[Container] refused secret key: TIMEOUT_SECRET",
+    );
     expect(tracked.settlements()).toBe(1);
   });
 
@@ -252,6 +259,56 @@ describe("runContainer timeout state machine — D2 matrix", () => {
     expect(console.error).toHaveBeenCalledWith(
       expect.stringMatching(/Containment failure:.*kuchiclaw-tg-123.*could not be confirmed/),
     );
+  });
+});
+
+describe("runContainer structured warnings", () => {
+  it.each(["success", "error"] as const)("logs warnings on normal %s output", async (status) => {
+    const promise = runContainer(input(), undefined, { owner: "orchestrator" });
+    proc.stdout.emit("data", output({
+      status,
+      ...(status === "error" ? { error: "agent stopped" } : {}),
+      warnings: ["refused secret key: UNKNOWN_SECRET"],
+    }));
+    proc.emit("close", status === "success" ? 0 : 1);
+
+    await expect(promise).resolves.toMatchObject({ status });
+    expect(console.warn).toHaveBeenCalledWith(
+      "[Container] refused secret key: UNKNOWN_SECRET",
+    );
+  });
+
+  it("logs at most 20 warnings from one output", async () => {
+    const promise = runContainer(input(), undefined, { owner: "orchestrator" });
+    proc.stdout.emit("data", output({
+      warnings: Array.from({ length: 25 }, (_, index) => `warning-${index}`),
+    }));
+    proc.emit("close", 0);
+
+    await promise;
+    expect(console.warn).toHaveBeenCalledTimes(20);
+    expect(console.warn).toHaveBeenNthCalledWith(20, "[Container] warning-19");
+    expect(console.warn).not.toHaveBeenCalledWith("[Container] warning-20");
+  });
+
+  it("sanitizes newlines, control characters, and ANSI escapes", async () => {
+    const promise = runContainer(input(), undefined, { owner: "orchestrator" });
+    proc.stdout.emit("data", output({
+      warnings: ["line1\n\u001b[31mred\u001b[0m\tend\u007f"],
+    }));
+    proc.emit("close", 0);
+
+    await promise;
+    expect(console.warn).toHaveBeenCalledWith("[Container] line1  red  end ");
+  });
+
+  it("truncates each warning to 200 sanitized characters", async () => {
+    const promise = runContainer(input(), undefined, { owner: "orchestrator" });
+    proc.stdout.emit("data", output({ warnings: ["x".repeat(250)] }));
+    proc.emit("close", 0);
+
+    await promise;
+    expect(console.warn).toHaveBeenCalledWith(`[Container] ${"x".repeat(200)}`);
   });
 });
 

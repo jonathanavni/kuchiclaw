@@ -8,6 +8,7 @@ export interface McpServerConfig {
 }
 
 /** Input passed to the container via stdin */
+// Keep ContainerInput/ContainerOutput in sync with ../container/prepare.ts and ../container/entrypoint.ts.
 export interface ContainerInput {
   prompt: string;
   sessionId?: string;
@@ -83,6 +84,8 @@ export interface ContainerOutput {
   result?: string;
   newSessionId?: string;
   error?: string;
+  /** Refused secret names surfaced to the host even when the run succeeds. */
+  warnings?: string[];
   /** Fresh OAuth tokens if the container refreshed them — host persists these to oauth.json */
   newTokens?: { accessToken: string; refreshToken: string; expiresAt: number };
 }

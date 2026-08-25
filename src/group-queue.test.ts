@@ -22,11 +22,12 @@ vi.mock("./db.js", () => ({
 // Real AuthUnavailableError, mockable getSecrets.
 vi.mock("./auth.js", async () => {
   const actual = await vi.importActual<typeof import("./auth.js")>("./auth.js");
-  return { ...actual, getSecrets: vi.fn() };
+  return { ...actual, getSecrets: vi.fn(), getSkillSecrets: vi.fn() };
 });
 
 import { runContainer } from "./container-runner.js";
-import { getSecrets, AuthUnavailableError } from "./auth.js";
+import { getSecrets, getSkillSecrets, AuthUnavailableError } from "./auth.js";
+import { getRefreshToken } from "./oauth-refresh.js";
 import { updateMessageStatus, insertMessage } from "./db.js";
 import { assertDestinationAllowed } from "./ipc-auth.js";
 import { ContainerTerminationUnknownError } from "./container-errors.js";
@@ -73,6 +74,8 @@ function runJob(overrides: Record<string, unknown>): Promise<{ result?: string; 
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(getSecrets).mockResolvedValue(okAuth);
+  vi.mocked(getSkillSecrets).mockReturnValue({});
+  vi.mocked(getRefreshToken).mockReturnValue(null);
   configureLifecycle({ owner: "orchestrator" });
 });
 
@@ -209,6 +212,60 @@ describe("group-queue executeJob", () => {
     expect(runContainer).not.toHaveBeenCalled();
     expect(channel.sendMessage).not.toHaveBeenCalled();
     expect(updateMessageStatus).toHaveBeenCalledWith(7, "failed");
+  });
+
+  it("injects FASTMAIL only for the entitled group", async () => {
+    vi.mocked(runContainer).mockResolvedValue({ status: "success", result: "ok" });
+    vi.mocked(getSkillSecrets).mockImplementation((group): Record<string, string> => group === "tg-123"
+      ? { FASTMAIL_API_TOKEN: "fm-token" }
+      : {});
+
+    await runJob({ group: "tg-456", chatId: "456" });
+    await runJob({ group: "tg-123", chatId: "123" });
+
+    const unentitledInput = vi.mocked(runContainer).mock.calls[0][0];
+    const entitledInput = vi.mocked(runContainer).mock.calls[1][0];
+    expect(unentitledInput.secrets.FASTMAIL_API_TOKEN).toBeUndefined();
+    expect(entitledInput.secrets.FASTMAIL_API_TOKEN).toBe("fm-token");
+  });
+
+  it("spreads auth last so a skill secret cannot shadow auth", async () => {
+    vi.mocked(runContainer).mockResolvedValue({ status: "success", result: "ok" });
+    vi.mocked(getSkillSecrets).mockReturnValue({ CLAUDE_CODE_OAUTH_TOKEN: "skill-shadow" });
+    vi.mocked(getSecrets).mockResolvedValue({
+      secrets: { CLAUDE_CODE_OAUTH_TOKEN: "real-auth" },
+      isApiKeyFallback: false,
+      source: "env-token",
+    });
+
+    await runJob({});
+
+    expect(vi.mocked(runContainer).mock.calls[0][0].secrets.CLAUDE_CODE_OAUTH_TOKEN)
+      .toBe("real-auth");
+  });
+
+  it("passes refreshToken only on oauth-json and only as the typed field", async () => {
+    vi.mocked(runContainer).mockResolvedValue({ status: "success", result: "ok" });
+    vi.mocked(getRefreshToken).mockReturnValue("long-lived-refresh");
+    vi.mocked(getSecrets).mockResolvedValueOnce({
+      secrets: { CLAUDE_CODE_OAUTH_TOKEN: "oauth-access" },
+      isApiKeyFallback: false,
+      source: "oauth-json",
+    }).mockResolvedValueOnce({
+      secrets: { CLAUDE_CODE_OAUTH_TOKEN: "env-access" },
+      isApiKeyFallback: false,
+      source: "env-token",
+    });
+
+    await runJob({});
+    await runJob({});
+
+    const oauthInput = vi.mocked(runContainer).mock.calls[0][0];
+    const envInput = vi.mocked(runContainer).mock.calls[1][0];
+    expect(oauthInput.refreshToken).toBe("long-lived-refresh");
+    expect(Object.values(oauthInput.secrets)).not.toContain("long-lived-refresh");
+    expect(oauthInput.secrets).not.toHaveProperty("refreshToken");
+    expect(envInput.refreshToken).toBeUndefined();
   });
 
   it("never runs more than MAX_CONTAINERS_PER_GROUP containers at once for a group", async () => {

@@ -81,6 +81,7 @@ MAIN_CHAT_ID=tg-your-chat-id       # Send /start to the bot, it will echo your c
 # Optional
 ANTHROPIC_API_KEY=sk-ant-...        # Fallback if OAuth isn't set up (auto-downgrades to Sonnet)
 FASTMAIL_API_TOKEN=...              # For the email skill
+FASTMAIL_GROUPS=main,tg-123         # Explicitly entitled groups (unset/empty = no access)
 ALLOWED_SENDER_IDS=123456789        # Comma-separated Telegram user IDs (empty = allow all)
 ```
 

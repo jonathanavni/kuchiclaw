@@ -5,7 +5,7 @@
 import { runContainer, type ContainerLifecycle } from "./container-runner.js";
 import { ContainerTerminationUnknownError } from "./container-errors.js";
 import { ensureGroupFolder } from "./group-folder.js";
-import { getSecrets } from "./auth.js";
+import { getSecrets, getSkillSecrets } from "./auth.js";
 import { getRefreshToken } from "./oauth-refresh.js";
 import { insertMessage, getRecentMessages, formatHistory, updateMessageStatus } from "./db.js";
 import {
@@ -145,11 +145,11 @@ async function executeJob(job: Job): Promise<void> {
   // A missing credential is transient on the VPS (blocked refresh, stale token),
   // so fail THIS job — never take the whole orchestrator down (getSecrets throws
   // instead of process.exit now). No retry: retrying an auth gap just spins.
-  let secrets: Record<string, string>;
+  let authSecrets: Record<string, string>;
   let isApiKeyFallback: boolean;
   let source: string;
   try {
-    ({ secrets, isApiKeyFallback, source } = await getSecrets());
+    ({ secrets: authSecrets, isApiKeyFallback, source } = await getSecrets());
   } catch (err) {
     const message = err instanceof AuthUnavailableError ? err.message : String(err);
     console.error(`[Queue] Auth unavailable, failing job: ${message}`);
@@ -170,7 +170,7 @@ async function executeJob(job: Job): Promise<void> {
     prompt: text,
     groupFolder: group,
     chatId,
-    secrets,
+    secrets: { ...getSkillSecrets(group), ...authSecrets },
     // Refresh token lets the container self-heal when the access token is stale —
     // containers can reach platform.claude.com even when the VPS host is blocked.
     // Only on the oauth.json path: a container refresh overrides the access token

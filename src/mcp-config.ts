@@ -10,6 +10,14 @@ export function loadMcpServers(): Record<string, McpServerConfig> | undefined {
     const servers = JSON.parse(raw) as Record<string, McpServerConfig>;
     const count = Object.keys(servers).length;
     if (count > 0) {
+      for (const [name, config] of Object.entries(servers)) {
+        const envKeys = Object.keys(config.env ?? {});
+        if (envKeys.length > 0) {
+          console.warn(
+            `[Security] MCP server "${name}" env keys (${envKeys.join(", ")}) are visible to all groups`,
+          );
+        }
+      }
       console.log(`[Orchestrator] Loaded ${count} MCP server(s) from mcp-servers.json`);
       return servers;
     }

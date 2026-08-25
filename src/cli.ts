@@ -11,7 +11,7 @@ import { runContainer } from "./container-runner.js";
 import type { ContainerTerminationUnknownError } from "./container-errors.js";
 import { ensureGroupFolder } from "./group-folder.js";
 import { insertMessage, updateMessageStatus, getRecentMessages, formatHistory } from "./db.js";
-import { getSecrets } from "./auth.js";
+import { getSecrets, getSkillSecrets } from "./auth.js";
 import { isValidGroupName } from "./ipc-auth.js";
 import type { ContainerInput } from "./types.js";
 
@@ -82,7 +82,7 @@ export async function main() {
     process.exit(1);
   }
 
-  const { secrets, isApiKeyFallback } = await getSecrets();
+  const { secrets: authSecrets, isApiKeyFallback } = await getSecrets();
   const model = isApiKeyFallback ? "claude-sonnet-4-6" : undefined;
   const paths = ensureGroupFolder(group);
 
@@ -98,7 +98,7 @@ export async function main() {
   const input: ContainerInput = {
     prompt,
     groupFolder: group,
-    secrets,
+    secrets: { ...getSkillSecrets(group), ...authSecrets },
     messageHistory: messageHistory || undefined,
     model,
   };

@@ -25,6 +25,7 @@ RUN npm install --production && \
 
 # Copy entrypoint
 COPY container/entrypoint.ts ./
+COPY container/prepare.ts ./
 
 # Create non-root user (Claude Code refuses bypassPermissions as root)
 RUN useradd -m -s /bin/bash -u 999 agent

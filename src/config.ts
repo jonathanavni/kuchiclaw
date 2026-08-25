@@ -16,7 +16,7 @@ export const GROUPS_DIR = path.join(PROJECT_ROOT, "groups");
 export const DATA_DIR = path.join(PROJECT_ROOT, "data");
 
 /** Docker image name for agent containers */
-export const CONTAINER_IMAGE = "kuchiclaw-agent";
+export const CONTAINER_IMAGE = process.env.CONTAINER_IMAGE?.trim() || "kuchiclaw-agent";
 
 /** Sentinel markers for parsing container output */
 export const OUTPUT_START_MARKER = "---KUCHICLAW_OUTPUT_START---";

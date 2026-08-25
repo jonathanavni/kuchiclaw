@@ -4,6 +4,13 @@ const effects = vi.hoisted(() => ({
   runContainer: vi.fn(),
   insertMessage: vi.fn(() => 1),
   updateMessageStatus: vi.fn(),
+  getSecrets: vi.fn(async () => ({
+    secrets: { CLAUDE_CODE_OAUTH_TOKEN: "auth-token" },
+    isApiKeyFallback: false,
+  })),
+  getSkillSecrets: vi.fn((group: string) => group === "tg-123"
+    ? { FASTMAIL_API_TOKEN: "fm-token" }
+    : {}),
 }));
 
 // Force the no-main configuration regardless of any ambient .env — these tests
@@ -22,7 +29,8 @@ vi.mock("./db.js", () => ({
   formatHistory: vi.fn(() => ""),
 }));
 vi.mock("./auth.js", () => ({
-  getSecrets: vi.fn(async () => ({ secrets: {}, isApiKeyFallback: false })),
+  getSecrets: effects.getSecrets,
+  getSkillSecrets: effects.getSkillSecrets,
 }));
 
 import { main, validateCliGroup } from "./cli.js";
@@ -56,6 +64,36 @@ describe("CLI group validation without a configured main chat", () => {
 });
 
 describe("CLI containment signaling", () => {
+  it("scopes skill secrets by --group and keeps auth authoritative", async () => {
+    const argv = process.argv;
+    const stdinTty = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+    Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: true });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    effects.runContainer.mockResolvedValue({ status: "success", result: "ok" });
+
+    try {
+      process.argv = ["node", "src/cli.ts", "--group", "tg-123", "hello"];
+      await main();
+      process.argv = ["node", "src/cli.ts", "--group", "tg-456", "hello"];
+      await main();
+
+      expect(effects.runContainer.mock.calls[0][0].secrets).toEqual({
+        FASTMAIL_API_TOKEN: "fm-token",
+        CLAUDE_CODE_OAUTH_TOKEN: "auth-token",
+      });
+      expect(effects.runContainer.mock.calls[1][0].secrets).toEqual({
+        CLAUDE_CODE_OAUTH_TOKEN: "auth-token",
+      });
+      expect(effects.getSkillSecrets).toHaveBeenNthCalledWith(1, "tg-123");
+      expect(effects.getSkillSecrets).toHaveBeenNthCalledWith(2, "tg-456");
+    } finally {
+      process.argv = argv;
+      if (stdinTty) Object.defineProperty(process.stdin, "isTTY", stdinTty);
+      else delete (process.stdin as { isTTY?: boolean }).isTTY;
+    }
+  });
+
   it("preserves a valid result while signaling exit code 1", async () => {
     const argv = process.argv;
     const priorExitCode = process.exitCode;

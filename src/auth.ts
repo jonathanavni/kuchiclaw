@@ -3,6 +3,20 @@
 
 import { execSync } from "node:child_process";
 import { getOAuthToken } from "./oauth-refresh.js";
+import { isValidGroupName } from "./ipc-auth.js";
+
+export const SKILL_SECRET_SPECS = [
+  { env: "FASTMAIL_API_TOKEN", groupsEnv: "FASTMAIL_GROUPS" },
+] as const;
+
+const warnedEmptyEntitlements = new Set<string>();
+const warnedInvalidEntitlements = new Set<string>();
+
+/** Reset once-per-process warning state for isolated tests only. */
+export function resetSkillSecretWarningsForTest(): void {
+  warnedEmptyEntitlements.clear();
+  warnedInvalidEntitlements.clear();
+}
 
 /** Read OAuth token from macOS keychain where Claude Code stores it */
 function readTokenFromKeychain(): string | null {
@@ -83,10 +97,43 @@ export async function getSecrets(): Promise<AuthResult> {
     }
   }
 
-  // Optional skill secrets — passed through to container environment
-  if (process.env.FASTMAIL_API_TOKEN) {
-    secrets.FASTMAIL_API_TOKEN = process.env.FASTMAIL_API_TOKEN;
+  return { secrets, isApiKeyFallback, source };
+}
+
+/** Resolve skill credentials only for groups explicitly named at call time. */
+export function getSkillSecrets(group: string): Record<string, string> {
+  const secrets: Record<string, string> = {};
+
+  for (const spec of SKILL_SECRET_SPECS) {
+    const value = process.env[spec.env];
+    if (!value) continue;
+
+    const entitledGroups = new Set<string>();
+    for (const entry of (process.env[spec.groupsEnv] ?? "").split(",")) {
+      const name = entry.trim();
+      if (!name) continue;
+      if (!isValidGroupName(name)) {
+        const warningKey = `${spec.env}\0${name}`;
+        if (!warnedInvalidEntitlements.has(warningKey)) {
+          warnedInvalidEntitlements.add(warningKey);
+          console.warn(`[Auth] Invalid ${spec.groupsEnv} group "${name}" — skipping`);
+        }
+        continue;
+      }
+      entitledGroups.add(name);
+    }
+
+    if (entitledGroups.size === 0) {
+      if (!warnedEmptyEntitlements.has(spec.env)) {
+        warnedEmptyEntitlements.add(spec.env);
+        console.warn(
+          `[Auth] ${spec.env} is set but ${spec.groupsEnv} entitles no group — injecting it nowhere`,
+        );
+      }
+      continue;
+    }
+    if (entitledGroups.has(group)) secrets[spec.env] = value;
   }
 
-  return { secrets, isApiKeyFallback, source };
+  return secrets;
 }

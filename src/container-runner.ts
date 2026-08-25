@@ -25,6 +25,9 @@ export interface ContainerLifecycle {
 
 type RunnerState = "running" | "terminating" | "settled";
 
+const MAX_CONTAINER_WARNINGS = 20;
+const MAX_CONTAINER_WARNING_LENGTH = 200;
+
 export async function runContainer(
   input: ContainerInput,
   paths: GroupPaths | undefined,
@@ -95,6 +98,7 @@ export async function runContainer(
       try {
         const output = parseOutput(stdout);
         if (output) {
+          logWarnings(output);
           persistNewTokens(output);
           settle(() => resolve(output));
           return;
@@ -122,7 +126,10 @@ export async function runContainer(
         terminationAdjudicated = true;
         deathConfirmed = termination.confirmed;
         output = parseOutput(stdout);
-        if (output) persistNewTokens(output);
+        if (output) {
+          logWarnings(output);
+          persistNewTokens(output);
+        }
 
         if (!deathConfirmed) {
           containment = new ContainerTerminationUnknownError(
@@ -267,6 +274,23 @@ function persistNewTokens(output: ContainerOutput): void {
   } catch (err) {
     console.error(`[OAuth] Failed to persist tokens from container refresh: ${formatError(err)}`);
   }
+}
+
+function logWarnings(output: ContainerOutput): void {
+  if (!Array.isArray(output.warnings)) return;
+  for (const warning of output.warnings.slice(0, MAX_CONTAINER_WARNINGS)) {
+    if (typeof warning === "string") {
+      console.warn(`[Container] ${sanitizeWarning(warning.slice(0, MAX_CONTAINER_WARNING_LENGTH))}`);
+    }
+  }
+}
+
+function sanitizeWarning(warning: string): string {
+  return warning
+    .replace(/\x1B\][^\x07]*(?:\x07|\x1B\\|$)/g, " ")
+    .replace(/(?:\x1B\[|\x9B)[0-?]*[ -/]*[@-~]/g, " ")
+    .replace(/\x1B[@-_]/g, " ")
+    .replace(/[\x00-\x1F\x7F]/g, " ");
 }
 
 function invalidOutputError(code: number | null, stdout: string, stderr: string): Error {
