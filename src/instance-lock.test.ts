@@ -1,50 +1,12 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-
-const sockets = vi.hoisted(() => ({ held: new Set<number>(), nextPort: 55_000 }));
-
-vi.mock("node:net", async () => {
-  const { EventEmitter } = await vi.importActual<typeof import("node:events")>("node:events");
-  return { default: {
-    createServer: () => {
-      class FakeServer extends EventEmitter {
-        listening = false;
-        private port = 0;
-
-        listen(requestedPort: number, _host: string, callback: () => void) {
-          const port = requestedPort === 0 ? sockets.nextPort++ : requestedPort;
-          if (sockets.held.has(port)) {
-            queueMicrotask(() => this.emit("error", Object.assign(new Error("in use"), { code: "EADDRINUSE" })));
-            return this;
-          }
-          this.port = port;
-          this.listening = true;
-          sockets.held.add(port);
-          queueMicrotask(callback);
-          return this;
-        }
-
-        address() { return { address: "127.0.0.1", family: "IPv4", port: this.port }; }
-
-        close(callback?: (err?: Error) => void) {
-          if (this.listening) sockets.held.delete(this.port);
-          this.listening = false;
-          queueMicrotask(() => callback?.());
-          return this;
-        }
-      }
-      return new FakeServer();
-    },
-  } };
-});
-
+import net from "node:net";
+import { describe, expect, it } from "vitest";
 import { acquireInstanceLock } from "./instance-lock.js";
 
-beforeEach(() => sockets.held.clear());
-
-describe("TCP instance lock", () => {
-  it("allows exactly one holder on the same port", async () => {
+describe("TCP instance lock with real loopback sockets", () => {
+  it("allows exactly one holder on a loopback port", async () => {
     const first = await acquireInstanceLock(0);
     try {
+      expect(first.host).toBe("127.0.0.1");
       await expect(acquireInstanceLock(first.port)).rejects.toThrow(
         new RegExp(`another orchestrator instance.*port ${first.port} in use`),
       );
@@ -53,18 +15,38 @@ describe("TCP instance lock", () => {
     }
   });
 
-  it("frees the port after the holder closes", async () => {
+  it("frees the real port after the holder closes", async () => {
     const first = await acquireInstanceLock(0);
     const port = first.port;
     await first.release();
+
     const second = await acquireInstanceLock(port);
     expect(second.port).toBe(port);
+    expect(second.host).toBe("127.0.0.1");
     await second.release();
   });
 
-  it("respects a caller-supplied port", async () => {
-    const lock = await acquireInstanceLock(48_765);
-    expect(lock.port).toBe(48_765);
+  it("respects a caller-supplied free port", async () => {
+    const port = await findFreeLoopbackPort();
+    const lock = await acquireInstanceLock(port);
+    expect(lock.port).toBe(port);
+    expect(lock.host).toBe("127.0.0.1");
     await lock.release();
   });
 });
+
+function findFreeLoopbackPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const probe = net.createServer();
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", () => {
+      const address = probe.address();
+      if (!address || typeof address === "string") {
+        probe.close();
+        reject(new Error("loopback probe did not return a TCP address"));
+        return;
+      }
+      probe.close((err) => err ? reject(err) : resolve(address.port));
+    });
+  });
+}

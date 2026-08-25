@@ -2,6 +2,7 @@ import net from "node:net";
 import { INSTANCE_LOCK_PORT } from "./config.js";
 
 export interface InstanceLock {
+  host: string;
   port: number;
   release(): Promise<void>;
 }
@@ -29,9 +30,11 @@ export function acquireInstanceLock(port = INSTANCE_LOCK_PORT): Promise<Instance
       acquired = true;
       server.removeListener("error", onError);
       const address = server.address();
+      const boundHost = typeof address === "object" && address ? address.address : "127.0.0.1";
       const boundPort = typeof address === "object" && address ? address.port : port;
       let released = false;
       resolve({
+        host: boundHost,
         port: boundPort,
         release: () => new Promise<void>((releaseResolve, releaseReject) => {
           if (released || !server.listening) {

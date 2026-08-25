@@ -59,7 +59,8 @@ export const SHUTDOWN_TIMEOUT_MS = 60 * 1000;
 export const SHUTDOWN_REAP_DRAIN_MS = 5 * 1000;
 
 /** Kernel-owned orchestrator singleton backstop. */
-export const INSTANCE_LOCK_PORT = Number.parseInt(process.env.INSTANCE_LOCK_PORT ?? "47671", 10);
+const DEFAULT_INSTANCE_LOCK_PORT = 47_671;
+export const INSTANCE_LOCK_PORT = parsePortEnv("INSTANCE_LOCK_PORT", DEFAULT_INSTANCE_LOCK_PORT);
 
 /** Directory for IPC request files (containers write here, host polls) */
 export const IPC_DIR = path.join(DATA_DIR, "ipc");
@@ -108,3 +109,14 @@ export const MAIN_CHAT_ID = process.env.MAIN_CHAT_ID ?? "";
 export const ALLOWED_SENDER_IDS: string[] = process.env.ALLOWED_SENDER_IDS
   ? process.env.ALLOWED_SENDER_IDS.split(",").map((s) => s.trim()).filter(Boolean)
   : [];
+
+function parsePortEnv(name: string, fallback: number): number {
+  const configured = process.env[name];
+  if (configured === undefined || configured === "") return fallback;
+  if (/^\d+$/.test(configured)) {
+    const value = Number(configured);
+    if (Number.isSafeInteger(value) && value >= 1 && value <= 65_535) return value;
+  }
+  console.warn(`[Config] Invalid ${name}=${JSON.stringify(configured)}; using default ${fallback}`);
+  return fallback;
+}

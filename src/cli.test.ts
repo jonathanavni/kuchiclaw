@@ -1,4 +1,10 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+const effects = vi.hoisted(() => ({
+  runContainer: vi.fn(),
+  insertMessage: vi.fn(() => 1),
+  updateMessageStatus: vi.fn(),
+}));
 
 // Force the no-main configuration regardless of any ambient .env — these tests
 // assert the CLI's behavior when MAIN_CHAT_ID is unset. (Same config-mock
@@ -7,8 +13,25 @@ vi.mock("./config.js", async () => {
   const actual = await vi.importActual<typeof import("./config.js")>("./config.js");
   return { ...actual, MAIN_CHAT_ID: "" };
 });
+vi.mock("./container-runner.js", () => ({ runContainer: effects.runContainer }));
+vi.mock("./group-folder.js", () => ({ ensureGroupFolder: vi.fn(() => ({})) }));
+vi.mock("./db.js", () => ({
+  insertMessage: effects.insertMessage,
+  updateMessageStatus: effects.updateMessageStatus,
+  getRecentMessages: vi.fn(() => []),
+  formatHistory: vi.fn(() => ""),
+}));
+vi.mock("./auth.js", () => ({
+  getSecrets: vi.fn(async () => ({ secrets: {}, isApiKeyFallback: false })),
+}));
 
 import { main, validateCliGroup } from "./cli.js";
+import { ContainerTerminationUnknownError } from "./container-errors.js";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.clearAllMocks();
+});
 
 describe("CLI group validation without a configured main chat", () => {
   it("rejects the default main group with remediation", () => {
@@ -28,6 +51,48 @@ describe("CLI group validation without a configured main chat", () => {
       await expect(main()).rejects.toThrow(/set MAIN_CHAT_ID or pass --group tg-<id>/);
     } finally {
       process.argv = argv;
+    }
+  });
+});
+
+describe("CLI containment signaling", () => {
+  it("preserves a valid result while signaling exit code 1", async () => {
+    const argv = process.argv;
+    const priorExitCode = process.exitCode;
+    const stdinTty = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+    process.argv = ["node", "src/cli.ts", "--group", "tg-123", "hello"];
+    process.exitCode = undefined;
+    Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: true });
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    effects.runContainer.mockImplementationOnce(async (_input, _paths, lifecycle) => {
+      lifecycle.onContainmentFailure(
+        new ContainerTerminationUnknownError(
+          "Container kuchiclaw-tg-123-1-deadbeef termination could not be confirmed",
+        ),
+      );
+      return { status: "success", result: "preserved result" };
+    });
+
+    try {
+      await main();
+
+      expect(log).toHaveBeenCalledWith("preserved result");
+      expect(error).toHaveBeenCalledWith(
+        expect.stringMatching(/kuchiclaw-tg-123-1-deadbeef.*container may still be alive/),
+      );
+      expect(process.exitCode).toBe(1);
+      expect(effects.updateMessageStatus).toHaveBeenCalledWith(1, "done");
+      expect(effects.runContainer).toHaveBeenCalledWith(
+        expect.any(Object),
+        expect.any(Object),
+        expect.objectContaining({ owner: "cli", onContainmentFailure: expect.any(Function) }),
+      );
+    } finally {
+      process.argv = argv;
+      process.exitCode = priorExitCode;
+      if (stdinTty) Object.defineProperty(process.stdin, "isTTY", stdinTty);
+      else delete (process.stdin as { isTTY?: boolean }).isTTY;
     }
   });
 });

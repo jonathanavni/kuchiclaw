@@ -2,7 +2,6 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ContainerTerminationUnknownError } from "./container-errors.js";
 
 const effects = vi.hoisted(() => ({
   acquireLock: vi.fn(),
@@ -10,14 +9,13 @@ const effects = vi.hoisted(() => ({
   channelConstructed: vi.fn(),
   channelConnect: vi.fn(),
   channelDisconnect: vi.fn(),
-  configureLifecycle: vi.fn(),
-  enqueue: vi.fn(),
+  ensureGroupFolder: vi.fn(() => ({})),
   execDocker: vi.fn(),
   getOrphanedMessages: vi.fn(),
   getSecrets: vi.fn(),
   quarantineRoot: vi.fn(),
   registerSender: vi.fn(),
-  shutdownQueue: vi.fn(),
+  runContainer: vi.fn(),
   startPolling: vi.fn(),
   startScheduler: vi.fn(),
   stopPolling: vi.fn(),
@@ -30,6 +28,7 @@ vi.mock("./config.js", async () => {
     ...actual,
     ALLOWED_SENDER_IDS: ["7"],
     MAIN_CHAT_ID: "tg-999",
+    MAX_CONTAINERS_PER_GROUP: 1,
     SHUTDOWN_REAP_DRAIN_MS: 20,
     SHUTDOWN_TIMEOUT_MS: 20,
     STUCK_SWEEP_MS: 60_000,
@@ -49,9 +48,12 @@ vi.mock("./channels/telegram.js", () => ({
     sendTyping() { return Promise.resolve(); }
   },
 }));
+vi.mock("./container-runner.js", () => ({ runContainer: effects.runContainer }));
 vi.mock("./db.js", () => ({
   IPC_LAYOUT_DB_VERSION: 2,
+  formatHistory: vi.fn(() => ""),
   getOrphanedMessages: effects.getOrphanedMessages,
+  getRecentMessages: vi.fn(() => []),
   getStuckProcessingMessages: vi.fn(() => []),
   incrementRecoveryCount: vi.fn(() => 1),
   initializeIpcLayoutEpoch: vi.fn(),
@@ -59,13 +61,8 @@ vi.mock("./db.js", () => ({
   inspectDbAttestation: vi.fn(),
   updateMessageStatus: vi.fn(),
 }));
-vi.mock("./group-queue.js", () => ({
-  configureLifecycle: effects.configureLifecycle,
-  enqueue: effects.enqueue,
-  isMessageInFlight: vi.fn(() => false),
-  shutdown: effects.shutdownQueue,
-}));
 vi.mock("./docker.js", () => ({ execDocker: effects.execDocker }));
+vi.mock("./group-folder.js", () => ({ ensureGroupFolder: effects.ensureGroupFolder }));
 vi.mock("./instance-lock.js", () => ({ acquireInstanceLock: effects.acquireLock }));
 vi.mock("./ipc.js", () => ({ registerSender: effects.registerSender }));
 vi.mock("./ipc-poll.js", () => ({
@@ -78,36 +75,46 @@ vi.mock("./task-scheduler.js", () => ({
   stopScheduler: effects.stopScheduler,
 }));
 
-import { main, preflightDocker, reapOrchestratorContainers } from "./index.js";
+type IndexModule = typeof import("./index.js");
+type QueueModule = typeof import("./group-queue.js");
 
 const ok = (stdout = "") => ({ ok: true, code: 0, stdout, stderr: "", timedOut: false });
-const bad = (stderr = "docker failed") => ({
-  ok: false, code: 1, stdout: "", stderr, timedOut: false,
-});
 
+let indexModule: IndexModule;
+let queueModule: QueueModule;
 let roots: string[] = [];
 let priorToken: string | undefined;
+let listeners: ReturnType<typeof signalListeners>;
 
-beforeEach(() => {
+beforeEach(async () => {
+  vi.resetModules();
   vi.clearAllMocks();
   vi.useRealTimers();
   roots = [];
+  listeners = signalListeners();
   priorToken = process.env.TELEGRAM_BOT_TOKEN;
   process.env.TELEGRAM_BOT_TOKEN = "test-token";
-  effects.releaseLock.mockResolvedValue(undefined);
-  effects.acquireLock.mockResolvedValue({ port: 47671, release: effects.releaseLock });
-  effects.channelConnect.mockResolvedValue(undefined);
-  effects.channelDisconnect.mockResolvedValue(undefined);
-  effects.getSecrets.mockResolvedValue({ secrets: {}, isApiKeyFallback: false });
-  effects.getOrphanedMessages.mockReturnValue([]);
-  effects.shutdownQueue.mockResolvedValue(undefined);
-  effects.execDocker.mockResolvedValue(ok());
+  effects.releaseLock.mockReset().mockResolvedValue(undefined);
+  effects.acquireLock.mockReset().mockResolvedValue({
+    host: "127.0.0.1", port: 47671, release: effects.releaseLock,
+  });
+  effects.channelConnect.mockReset().mockResolvedValue(undefined);
+  effects.channelDisconnect.mockReset().mockResolvedValue(undefined);
+  effects.execDocker.mockReset().mockResolvedValue(ok());
+  effects.getOrphanedMessages.mockReset().mockReturnValue([]);
+  effects.getSecrets.mockReset().mockResolvedValue({
+    secrets: {}, isApiKeyFallback: false, source: "keychain",
+  });
+  effects.runContainer.mockReset().mockResolvedValue({ status: "success", result: "ok" });
   vi.spyOn(console, "error").mockImplementation(() => {});
   vi.spyOn(console, "log").mockImplementation(() => {});
   vi.spyOn(console, "warn").mockImplementation(() => {});
+  indexModule = await import("./index.js");
+  queueModule = await import("./group-queue.js");
 });
 
 afterEach(() => {
+  cleanupSignalListeners(listeners);
   vi.useRealTimers();
   vi.restoreAllMocks();
   if (priorToken === undefined) delete process.env.TELEGRAM_BOT_TOKEN;
@@ -122,7 +129,7 @@ describe("startup gate ordering", () => {
     fs.mkdirSync(ipcDir);
     fs.writeFileSync(path.join(ipcDir, "legacy.json"), "{}");
 
-    await expect(main({
+    await expect(indexModule.main({
       skipBackoff: true,
       ipcDir,
       markerPath: path.join(root, "ipc-layout-v2"),
@@ -138,177 +145,138 @@ describe("startup gate ordering", () => {
     expect(effects.startScheduler).not.toHaveBeenCalled();
   });
 
-  it("finishes preflight and reap before recovery can re-enqueue", async () => {
+  it("finishes preflight and reap before recovery can start a container", async () => {
     effects.getOrphanedMessages.mockReturnValueOnce([{
       id: 9, group_folder: "tg-123", role: "user", content: "orphan",
       timestamp: "", processing_status: "processing", chat_id: "123",
       sender_name: "A", recovery_count: 0,
     }]);
 
-    const listeners = signalListeners();
-    await main(validOptions());
+    await indexModule.main(validOptions());
+    await vi.waitFor(() => expect(effects.runContainer).toHaveBeenCalledOnce());
 
-    expect(effects.enqueue).toHaveBeenCalledOnce();
     expect(effects.acquireLock.mock.invocationCallOrder[0]).toBeLessThan(
       effects.execDocker.mock.invocationCallOrder[0],
     );
-    const finalDockerOrder = effects.execDocker.mock.invocationCallOrder.at(-1)!;
-    expect(finalDockerOrder).toBeLessThan(effects.getOrphanedMessages.mock.invocationCallOrder[0]);
-    await stopStartedMain(listeners);
+    expect(effects.execDocker.mock.invocationCallOrder.at(-1)).toBeLessThan(
+      effects.runContainer.mock.invocationCallOrder[0],
+    );
+    await stopStartedMain();
   });
 });
 
-describe("fail-closed legacy-aware reap", () => {
-  it("aborts on first ps failure", async () => {
-    effects.execDocker.mockResolvedValueOnce(bad("daemon unavailable"));
-    await expect(reapOrchestratorContainers()).rejects.toThrow(/unverifiable IDs.*unknown/);
-    expect(effects.execDocker).toHaveBeenCalledOnce();
-  });
-
-  it("aborts on rm failure and names the target", async () => {
-    effects.execDocker
-      .mockResolvedValueOnce(ok("aaaaaaaaaaaa\n"))
-      .mockResolvedValueOnce(ok())
-      .mockResolvedValueOnce(bad("permission denied"));
-    await expect(reapOrchestratorContainers()).rejects.toThrow(/aaaaaaaaaaaa/);
-  });
-
-  it("aborts on final ps failure", async () => {
-    effects.execDocker
-      .mockResolvedValueOnce(ok("aaaaaaaaaaaa\n"))
-      .mockResolvedValueOnce(ok())
-      .mockResolvedValueOnce(ok())
-      .mockResolvedValueOnce(bad("final enumeration failed"));
-    await expect(reapOrchestratorContainers()).rejects.toThrow(/unverifiable IDs.*unknown/);
-  });
-
-  it("aborts and names a container that survives the final enumeration", async () => {
-    effects.execDocker
-      .mockResolvedValueOnce(ok("aaaaaaaaaaaa\n"))
-      .mockResolvedValueOnce(ok())
-      .mockResolvedValueOnce(ok())
-      .mockResolvedValueOnce(ok("aaaaaaaaaaaa\n"))
-      .mockResolvedValueOnce(ok());
-    await expect(reapOrchestratorContainers()).rejects.toThrow(/incomplete.*aaaaaaaaaaaa/);
-  });
-
-  it("removes unlabeled legacy containers but leaves CLI-labeled containers untouched", async () => {
-    let namedCalls = 0;
-    effects.execDocker.mockImplementation(async (args: string[]) => {
-      if (args[0] === "ps" && args.includes("label=kuchiclaw.owner=orchestrator")) return ok();
-      if (args[0] === "ps") {
-        namedCalls++;
-        return ok(namedCalls === 1 ? "aaaaaaaaaaaa\nbbbbbbbbbbbb\n" : "bbbbbbbbbbbb\n");
-      }
-      if (args[0] === "inspect" && args.at(-1) === "aaaaaaaaaaaa") return ok("null\n");
-      if (args[0] === "inspect") return ok('{"kuchiclaw.owner":"cli"}\n');
-      if (args[0] === "rm") return ok();
-      return bad("unexpected command");
-    });
-
-    await reapOrchestratorContainers();
-
-    expect(effects.execDocker).toHaveBeenCalledWith(["rm", "--force", "aaaaaaaaaaaa"]);
-    expect(effects.execDocker).not.toHaveBeenCalledWith(["rm", "--force", "bbbbbbbbbbbb"]);
-  });
-});
-
-describe("Docker startup preflight", () => {
-  it("fails actionably when the daemon version check fails", async () => {
-    effects.execDocker.mockResolvedValueOnce(bad("cannot connect"));
-    await expect(preflightDocker()).rejects.toThrow(/Docker daemon preflight failed.*reachable/);
-    expect(effects.execDocker).toHaveBeenCalledOnce();
-  });
-
-  it("fails actionably when the configured image is absent", async () => {
-    effects.execDocker.mockResolvedValueOnce(ok()).mockResolvedValueOnce(bad("No such image"));
-    await expect(preflightDocker()).rejects.toThrow(/Docker image preflight failed.*build or pull/);
-  });
-});
-
-describe("shutdown coordination", () => {
+describe("shutdown coordination with the real group queue", () => {
   it("reaps on first-drain timeout and waits a bounded second drain before exit", async () => {
-    vi.useFakeTimers();
-    let finish!: () => void;
-    const finished = new Promise<void>((resolve) => { finish = resolve; });
-    effects.shutdownQueue.mockReturnValueOnce(finished);
+    const active = deferred<{ status: "success"; result: string }>();
+    effects.runContainer.mockReturnValueOnce(active.promise);
     const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
-    const listeners = signalListeners();
-    await main(validOptions());
+    await indexModule.main(validOptions());
+    enqueueTestJob("tg-611", 61);
+    await vi.waitFor(() => expect(effects.runContainer).toHaveBeenCalledOnce());
     effects.execDocker.mockClear();
+    vi.useFakeTimers();
 
-    addedSignalListener("SIGTERM", listeners)();
+    addedSignalListener("SIGTERM")();
     await vi.advanceTimersByTimeAsync(20);
     expect(effects.execDocker).toHaveBeenCalled();
     expect(exit).not.toHaveBeenCalled();
 
-    finish();
+    active.resolve({ status: "success", result: "done" });
     await vi.advanceTimersByTimeAsync(0);
     expect(exit).toHaveBeenCalledWith(0);
-    cleanupSignalListeners(listeners);
   });
 
-  it("composes synchronous queue closure, deferred disconnect, active settle, and monotonic exit 1", async () => {
-    let disconnect!: () => void;
-    effects.channelDisconnect.mockReturnValueOnce(new Promise<void>((resolve) => { disconnect = resolve; }));
-    let settleActive!: () => void;
-    const active = new Promise<void>((resolve) => { settleActive = resolve; });
-    let accepting = true;
-    let queuedSameGroup = 1;
-    const runContainer = vi.fn(() => active);
-    runContainer(); // triggering active job
-    effects.shutdownQueue.mockImplementationOnce(() => {
-      accepting = false;
-      queuedSameGroup = 0;
-      return active;
+  it("closes acceptance synchronously and runs one coordinator for two containments", async () => {
+    const active = deferred<{ status: "success"; result: string }>();
+    const disconnect = deferred<void>();
+    let lifecycle: { onContainmentFailure?(error: Error): void } | undefined;
+    effects.channelDisconnect.mockReturnValueOnce(disconnect.promise);
+    effects.runContainer.mockImplementationOnce((_input, _paths, options) => {
+      lifecycle = options;
+      return active.promise;
     });
     const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
-    const listeners = signalListeners();
-    await main(validOptions());
-    const lifecycle = effects.configureLifecycle.mock.calls[0][0] as {
-      onContainmentFailure(error: ContainerTerminationUnknownError): void;
-    };
+    await indexModule.main(validOptions());
 
-    lifecycle.onContainmentFailure(new ContainerTerminationUnknownError("first"));
-    lifecycle.onContainmentFailure(new ContainerTerminationUnknownError("second"));
-    expect(accepting).toBe(false);
-    expect(queuedSameGroup).toBe(0);
+    enqueueTestJob("tg-711", 71);
+    await vi.waitFor(() => expect(effects.runContainer).toHaveBeenCalledOnce());
+    enqueueTestJob("tg-711", 72);
+
+    lifecycle!.onContainmentFailure!(new Error("first death unconfirmed"));
+    lifecycle!.onContainmentFailure!(new Error("second death unconfirmed"));
+    enqueueTestJob("tg-711", 73);
+
     expect(effects.stopPolling).toHaveBeenCalledOnce();
-    expect(effects.shutdownQueue.mock.invocationCallOrder[0]).toBeLessThan(
-      effects.channelDisconnect.mock.invocationCallOrder[0],
-    );
+    expect(effects.stopScheduler).toHaveBeenCalledOnce();
+    expect(effects.channelDisconnect).toHaveBeenCalledOnce();
     expect(effects.stopPolling.mock.invocationCallOrder[0]).toBeLessThan(
       effects.channelDisconnect.mock.invocationCallOrder[0],
     );
-    expect(runContainer).toHaveBeenCalledOnce();
+    expect(effects.runContainer).toHaveBeenCalledOnce();
     expect(exit).not.toHaveBeenCalled();
 
-    disconnect();
-    settleActive();
+    disconnect.resolve();
+    active.resolve({ status: "success", result: "preserved" });
     await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(1));
-    expect(runContainer).toHaveBeenCalledOnce();
-    cleanupSignalListeners(listeners);
+    expect(effects.runContainer).toHaveBeenCalledOnce();
+    expect(effects.channelDisconnect).toHaveBeenCalledOnce();
   });
 
   it("upgrades an in-progress signal shutdown to exit 1 on containment", async () => {
-    let disconnect!: () => void;
-    effects.channelDisconnect.mockReturnValueOnce(new Promise<void>((resolve) => { disconnect = resolve; }));
+    const active = deferred<{ status: "success"; result: string }>();
+    const disconnect = deferred<void>();
+    let lifecycle: { onContainmentFailure?(error: Error): void } | undefined;
+    effects.channelDisconnect.mockReturnValueOnce(disconnect.promise);
+    effects.runContainer.mockImplementationOnce((_input, _paths, options) => {
+      lifecycle = options;
+      return active.promise;
+    });
     const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
-    const listeners = signalListeners();
-    await main(validOptions());
-    const lifecycle = effects.configureLifecycle.mock.calls[0][0] as {
-      onContainmentFailure(error: ContainerTerminationUnknownError): void;
-    };
+    await indexModule.main(validOptions());
+    enqueueTestJob("tg-811", 81);
+    await vi.waitFor(() => expect(effects.runContainer).toHaveBeenCalledOnce());
 
-    addedSignalListener("SIGTERM", listeners)();
-    lifecycle.onContainmentFailure(new ContainerTerminationUnknownError("late containment"));
-    disconnect();
+    addedSignalListener("SIGTERM")();
+    lifecycle!.onContainmentFailure!(new Error("late containment"));
+    disconnect.resolve();
+    active.resolve({ status: "success", result: "done" });
 
     await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(1));
-    expect(effects.shutdownQueue).toHaveBeenCalledOnce();
-    cleanupSignalListeners(listeners);
+    expect(effects.channelDisconnect).toHaveBeenCalledOnce();
+  });
+
+  it("logs instance-lock release failure without escalating a clean exit", async () => {
+    effects.releaseLock.mockRejectedValueOnce(new Error("close failed"));
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    await indexModule.main(validOptions());
+
+    addedSignalListener("SIGTERM")();
+
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+    expect(console.error).toHaveBeenCalledWith(
+      expect.stringContaining("Instance lock release failed"),
+    );
   });
 });
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+function enqueueTestJob(group: string, messageId: number): void {
+  queueModule.enqueue({
+    group,
+    chatId: group.slice(3),
+    senderName: "tester",
+    text: "hello",
+    secrets: {},
+    channel: { sendMessage: vi.fn(async () => {}) } as never,
+    attempt: 1,
+    messageId,
+  });
+}
 
 function tempRoot(): string {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "kuchiclaw-order-"));
@@ -338,8 +306,8 @@ function signalListeners() {
   };
 }
 
-function addedSignalListener(signal: "SIGINT" | "SIGTERM", before: ReturnType<typeof signalListeners>) {
-  return process.listeners(signal).find((listener) => !before[signal].includes(listener)) as () => void;
+function addedSignalListener(signal: "SIGINT" | "SIGTERM") {
+  return process.listeners(signal).find((listener) => !listeners[signal].includes(listener)) as () => void;
 }
 
 function cleanupSignalListeners(before: ReturnType<typeof signalListeners>) {
@@ -350,9 +318,8 @@ function cleanupSignalListeners(before: ReturnType<typeof signalListeners>) {
   }
 }
 
-async function stopStartedMain(before: ReturnType<typeof signalListeners>) {
+async function stopStartedMain() {
   const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
-  addedSignalListener("SIGTERM", before)();
+  addedSignalListener("SIGTERM")();
   await vi.waitFor(() => expect(exit).toHaveBeenCalled());
-  cleanupSignalListeners(before);
 }

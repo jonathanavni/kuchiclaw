@@ -8,6 +8,7 @@ import "dotenv/config";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { runContainer } from "./container-runner.js";
+import type { ContainerTerminationUnknownError } from "./container-errors.js";
 import { ensureGroupFolder } from "./group-folder.js";
 import { insertMessage, updateMessageStatus, getRecentMessages, formatHistory } from "./db.js";
 import { getSecrets } from "./auth.js";
@@ -105,7 +106,13 @@ export async function main() {
   console.error(`[KuchiClaw] Group: ${group} | Prompt: "${prompt.slice(0, 80)}${prompt.length > 80 ? "..." : ""}"`);
 
   try {
-    const output = await runContainer(input, paths, { owner: "cli" });
+    const output = await runContainer(input, paths, {
+      owner: "cli",
+      onContainmentFailure: (error: ContainerTerminationUnknownError) => {
+        console.error(`[KuchiClaw] ${error.message}; container may still be alive`);
+        process.exitCode = 1;
+      },
+    });
 
     if (output.status === "success") {
       const result = output.result ?? "(no response)";

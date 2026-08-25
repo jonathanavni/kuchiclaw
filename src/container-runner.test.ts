@@ -120,7 +120,13 @@ describe("runContainer timeout state machine — D2 matrix", () => {
   it("kill-timeout+confirm-absent is retryable and settles once", async () => {
     docker.execDocker
       .mockResolvedValueOnce({ ok: false, code: null, stdout: "", stderr: "", timedOut: true })
-      .mockResolvedValueOnce({ ...ok, stdout: "" });
+      .mockResolvedValueOnce({
+        ok: false,
+        code: 1,
+        stdout: "",
+        stderr: "Error: No such object: kuchiclaw-tg-123",
+        timedOut: false,
+      });
     const containment = vi.fn();
     const tracked = track(runContainer(input(), undefined, {
       owner: "orchestrator", onContainmentFailure: containment,
@@ -133,6 +139,22 @@ describe("runContainer timeout state machine — D2 matrix", () => {
     expect(proc.kill.mock.invocationCallOrder[0]).toBeLessThan(
       docker.execDocker.mock.invocationCallOrder[1],
     );
+    expect(containment).not.toHaveBeenCalled();
+    expect(tracked.settlements()).toBe(1);
+  });
+
+  it("kill-timeout+confirm-stopped is retryable without containment", async () => {
+    docker.execDocker
+      .mockResolvedValueOnce({ ok: false, code: null, stdout: "", stderr: "", timedOut: true })
+      .mockResolvedValueOnce({ ...ok, stdout: "false\n" });
+    const containment = vi.fn();
+    const tracked = track(runContainer(input(), undefined, {
+      owner: "orchestrator", onContainmentFailure: containment,
+    }));
+    await fireTimeout();
+    proc.emit("close", 137);
+
+    await expect(tracked.promise).rejects.toThrow(/timed out/);
     expect(containment).not.toHaveBeenCalled();
     expect(tracked.settlements()).toBe(1);
   });
@@ -217,6 +239,20 @@ describe("runContainer timeout state machine — D2 matrix", () => {
     expect(containment).toHaveBeenCalledOnce();
     expect(tracked.settlements()).toBe(1);
   });
+
+  it("logs containment details when no lifecycle handler is registered", async () => {
+    docker.execDocker
+      .mockResolvedValueOnce({ ok: false, code: null, stdout: "", stderr: "", timedOut: true })
+      .mockResolvedValueOnce({ ...ok, stdout: "true" });
+    const tracked = track(runContainer(input(), undefined, { owner: "cli" }));
+    await fireTimeout();
+    proc.emit("close", 137);
+
+    await expect(tracked.promise).rejects.toBeInstanceOf(ContainerTerminationUnknownError);
+    expect(console.error).toHaveBeenCalledWith(
+      expect.stringMatching(/Containment failure:.*kuchiclaw-tg-123.*could not be confirmed/),
+    );
+  });
 });
 
 describe("runContainer argv", () => {
@@ -224,7 +260,12 @@ describe("runContainer argv", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "kuchiclaw-runner-"));
     const paths = makePaths(root);
     const now = vi.spyOn(Date, "now").mockReturnValue(1234);
-    const first = runContainer(input(), paths, { owner: "orchestrator" });
+    const secretValue = "must-not-appear-in-argv";
+    const first = runContainer(
+      { ...input(), secrets: { API_TOKEN: secretValue } },
+      paths,
+      { owner: "orchestrator" },
+    );
     const firstProc = proc;
     const secondProc = fakeChild();
     docker.spawnDocker.mockReturnValueOnce(secondProc);
@@ -237,7 +278,20 @@ describe("runContainer argv", () => {
     ]));
     expect(calls[1]).toEqual(expect.arrayContaining(["--label", "kuchiclaw.owner=cli"]));
     expect(calls[0]).not.toContain("-v");
-    expect(calls[0]).toContain("type=bind,src=" + paths.memory + ",dst=/workspace/MEMORY.md");
+    const mounts = calls[0].filter((arg) => arg.startsWith("type=bind,"));
+    const mountFor = (destination: string) => mounts.find((arg) => arg.includes(`dst=${destination}`));
+    for (const destination of [
+      "/workspace/SOUL.md",
+      "/workspace/TOOLS.md",
+      "/workspace/skills",
+      "/workspace/HEARTBEAT.md",
+    ]) {
+      expect(mountFor(destination)).toContain(",readonly");
+    }
+    for (const destination of ["/workspace/MEMORY.md", "/workspace/CONTEXT.md", "/workspace/ipc"]) {
+      expect(mountFor(destination)).not.toContain(",readonly");
+    }
+    expect(calls[0].some((arg) => arg.includes(secretValue))).toBe(false);
     const firstName = calls[0][calls[0].indexOf("--name") + 1];
     const secondName = calls[1][calls[1].indexOf("--name") + 1];
     expect(firstName).toMatch(/^kuchiclaw-tg-123-1234-[a-f0-9]{8}$/);

@@ -3,7 +3,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 // Fast retry delays so the retry/backoff paths don't make the suite slow.
 vi.mock("./config.js", async () => {
   const actual = await vi.importActual<typeof import("./config.js")>("./config.js");
-  return { ...actual, BASE_RETRY_MS: 1, DELIVERY_BASE_MS: 1, MAX_CONTAINERS_PER_GROUP: 2 };
+  return { ...actual, BASE_RETRY_MS: 1, DELIVERY_BASE_MS: 1, MAX_CONTAINERS_PER_GROUP: 1 };
 });
 
 // Authorization always passes here — identity validation is covered by ipc-auth tests.
@@ -30,7 +30,7 @@ import { getSecrets, AuthUnavailableError } from "./auth.js";
 import { updateMessageStatus, insertMessage } from "./db.js";
 import { assertDestinationAllowed } from "./ipc-auth.js";
 import { ContainerTerminationUnknownError } from "./container-errors.js";
-import { configureLifecycle, enqueue, isMessageInFlight } from "./group-queue.js";
+import { configureLifecycle, enqueue, isMessageInFlight, shutdown } from "./group-queue.js";
 
 /** A promise plus its resolve, for gating async mocks in concurrency tests. */
 function deferred<T>() {
@@ -235,15 +235,42 @@ describe("group-queue executeJob", () => {
 
     // Let the queue drain to its cap.
     await new Promise((r) => setTimeout(r, 20));
-    expect(started).toBe(2); // cap = 2 (mocked); the 3rd waits
+    expect(started).toBe(1); // cap = 1 (mocked); the rest wait
 
-    // Release the running jobs so the third can start and all finish.
-    gates[0].resolve(); gates[1].resolve();
+    // Release each running job so the queue advances one slot at a time.
+    gates[0].resolve();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(started).toBe(2);
+    gates[1].resolve();
     await new Promise((r) => setTimeout(r, 20));
     gates[2].resolve();
     await new Promise((r) => setTimeout(r, 20));
 
-    expect(peak).toBe(2);
+    expect(peak).toBe(1);
     expect(started).toBe(3);
+  });
+
+  it("shutdown closes acceptance and discards a queued same-group job", async () => {
+    const first = deferred<void>();
+    vi.mocked(runContainer).mockImplementationOnce(async () => {
+      await first.promise;
+      return { status: "success", result: "first" };
+    });
+    const channel = makeChannel();
+    const base = {
+      group: "tg-shutdown", chatId: "123", senderName: "t", text: "x",
+      secrets: {}, channel: channel as never, attempt: 1,
+    };
+
+    enqueue({ ...base, messageId: 51 });
+    enqueue({ ...base, messageId: 52 });
+    await vi.waitFor(() => expect(runContainer).toHaveBeenCalledOnce());
+
+    const finished = shutdown();
+    enqueue({ ...base, messageId: 53 });
+    first.resolve();
+    await finished;
+
+    expect(runContainer).toHaveBeenCalledOnce();
   });
 });

@@ -147,7 +147,11 @@ export async function runContainer(
             `Container ${containerName} termination could not be confirmed`,
           );
           try {
-            lifecycle.onContainmentFailure?.(containment);
+            if (lifecycle.onContainmentFailure) {
+              lifecycle.onContainmentFailure(containment);
+            } else {
+              console.error(`[Container] Containment failure: ${containment.message}`);
+            }
           } catch (err) {
             console.error(`[Container] Containment notification failed: ${formatError(err)}`);
           }
@@ -230,8 +234,11 @@ async function terminateContainer(
   killAttachClient();
   const inspected = await execDocker(["inspect", "-f", "{{.State.Running}}", name]);
   const running = inspected.stdout.trim().toLowerCase();
-  if (inspected.ok && (running === "" || running === "false")) {
-    return { confirmed: true, detail: running || "container absent" };
+  if (inspected.ok && running === "false") {
+    return { confirmed: true, detail: "container stopped" };
+  }
+  if (!inspected.ok && !inspected.timedOut && isContainerAbsent(inspected.stderr)) {
+    return { confirmed: true, detail: inspected.stderr.trim() || "container absent" };
   }
   return {
     confirmed: false,
@@ -241,6 +248,10 @@ async function terminateContainer(
 
 function isBenignKillFailure(stderr: string): boolean {
   return /no such container|is not running/i.test(stderr);
+}
+
+function isContainerAbsent(stderr: string): boolean {
+  return /no such (?:object|container)/i.test(stderr);
 }
 
 function summarizeDocker(result: DockerExecResult): string {
