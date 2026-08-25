@@ -29,7 +29,8 @@ import { runContainer } from "./container-runner.js";
 import { getSecrets, AuthUnavailableError } from "./auth.js";
 import { updateMessageStatus, insertMessage } from "./db.js";
 import { assertDestinationAllowed } from "./ipc-auth.js";
-import { enqueue } from "./group-queue.js";
+import { ContainerTerminationUnknownError } from "./container-errors.js";
+import { configureLifecycle, enqueue, isMessageInFlight } from "./group-queue.js";
 
 /** A promise plus its resolve, for gating async mocks in concurrency tests. */
 function deferred<T>() {
@@ -72,6 +73,7 @@ function runJob(overrides: Record<string, unknown>): Promise<{ result?: string; 
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(getSecrets).mockResolvedValue(okAuth);
+  configureLifecycle({ owner: "orchestrator" });
 });
 
 describe("group-queue executeJob", () => {
@@ -154,6 +156,40 @@ describe("group-queue executeJob", () => {
 
     expect(done.error).toMatch(/unauthorized/);
     expect(runContainer).toHaveBeenCalledTimes(1); // auth errors are terminal
+  });
+
+  it("does not retry termination-unknown and releases the message slot exactly once", async () => {
+    vi.mocked(runContainer).mockRejectedValue(
+      new ContainerTerminationUnknownError("death unconfirmed"),
+    );
+    const onError = vi.fn();
+
+    const done = await new Promise<{ error: string }>((resolve) => {
+      enqueue({
+        group: "tg-123", chatId: "123", senderName: "tester", text: "hello",
+        secrets: {}, channel: makeChannel() as never, attempt: 1, messageId: 41,
+        onError: (error) => { onError(error); resolve({ error }); },
+      });
+    });
+
+    expect(done.error).toBe("death unconfirmed");
+    expect(runContainer).toHaveBeenCalledTimes(1);
+    expect(updateMessageStatus).toHaveBeenCalledWith(41, "failed");
+    expect(onError).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(isMessageInFlight(41)).toBe(false));
+  });
+
+  it("keeps a message in-flight while the runner is terminating", async () => {
+    const terminating = deferred<{ status: "success"; result: string }>();
+    vi.mocked(runContainer).mockReturnValueOnce(terminating.promise);
+    const done = runJob({ messageId: 42 });
+
+    await vi.waitFor(() => expect(runContainer).toHaveBeenCalledOnce());
+    expect(isMessageInFlight(42)).toBe(true);
+
+    terminating.resolve({ status: "success", result: "safe" });
+    await done;
+    await vi.waitFor(() => expect(isMessageInFlight(42)).toBe(false));
   });
 
   it("checks destination identity FIRST — before auth, container, or reply", async () => {

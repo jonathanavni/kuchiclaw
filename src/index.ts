@@ -23,7 +23,14 @@ import {
   type DbAttestation,
   type Message,
 } from "./db.js";
-import { enqueue, shutdown as shutdownQueue, isMessageInFlight } from "./group-queue.js";
+import {
+  configureLifecycle,
+  enqueue,
+  shutdown as shutdownQueue,
+  isMessageInFlight,
+} from "./group-queue.js";
+import { execDocker, type DockerExecResult } from "./docker.js";
+import { acquireInstanceLock } from "./instance-lock.js";
 import { registerSender } from "./ipc.js";
 import {
   quarantineLooseRootRequests,
@@ -37,7 +44,9 @@ import {
   IPC_DIR,
   IPC_LAYOUT_MARKER,
   MAIN_CHAT_ID,
+  CONTAINER_IMAGE,
   SHUTDOWN_TIMEOUT_MS,
+  SHUTDOWN_REAP_DRAIN_MS,
   MCP_SERVERS_PATH,
   STUCK_SWEEP_MS,
   STUCK_THRESHOLD_SEC,
@@ -145,6 +154,103 @@ function loadMcpServers(): Record<string, McpServerConfig> | undefined {
   return undefined;
 }
 
+export async function preflightDocker(): Promise<void> {
+  const version = await execDocker(["version"]);
+  if (!version.ok) {
+    throw new Error(`Docker daemon preflight failed; verify Docker is installed and reachable: ${dockerSummary(version)}`);
+  }
+  const image = await execDocker(["image", "inspect", CONTAINER_IMAGE]);
+  if (!image.ok) {
+    throw new Error(
+      `Docker image preflight failed for ${CONTAINER_IMAGE}; build or pull the image before startup: ${dockerSummary(image)}`,
+    );
+  }
+}
+
+/** Remove orchestrator-owned and pre-label legacy containers, never CLI-labeled runs. */
+export async function reapOrchestratorContainers(): Promise<void> {
+  const initial = await enumerateReapTargets("initial");
+  const remaining = new Set(initial);
+  for (const id of initial) {
+    const removed = await execDocker(["rm", "--force", id]);
+    if (!removed.ok) {
+      throw new Error(
+        `Docker reap removal failed; surviving/unverifiable IDs: ${[...remaining].join(", ")}; ` +
+        `${id}: ${dockerSummary(removed)}`,
+      );
+    }
+    remaining.delete(id);
+  }
+
+  const survivors = await enumerateReapTargets("final");
+  if (survivors.size > 0) {
+    throw new Error(`Docker reap incomplete; surviving/unverifiable IDs: ${[...survivors].join(", ")}`);
+  }
+}
+
+async function enumerateReapTargets(stage: string): Promise<Set<string>> {
+  const ownedResult = await execDocker([
+    "ps", "-aq", "--filter", "label=kuchiclaw.owner=orchestrator",
+  ]);
+  const owned = parseDockerIds(ownedResult, `${stage} owner enumeration`);
+  const namedResult = await execDocker([
+    "ps", "-aq", "--filter", "name=^kuchiclaw-",
+  ]);
+  const named = parseDockerIds(namedResult, `${stage} legacy enumeration`);
+  const targets = new Set(owned);
+
+  for (const id of named) {
+    if (targets.has(id)) continue;
+    const inspected = await execDocker(["inspect", "-f", "{{json .Config.Labels}}", id]);
+    if (!inspected.ok) {
+      throw new Error(
+        `Docker reap could not verify labels; surviving/unverifiable IDs: ${id}; ${dockerSummary(inspected)}`,
+      );
+    }
+    let labels: Record<string, unknown> | null;
+    try {
+      labels = JSON.parse(inspected.stdout.trim() || "null") as Record<string, unknown> | null;
+    } catch {
+      throw new Error(`Docker reap received malformed labels; surviving/unverifiable IDs: ${id}`);
+    }
+    if (labels !== null && (typeof labels !== "object" || Array.isArray(labels))) {
+      throw new Error(`Docker reap received malformed labels; surviving/unverifiable IDs: ${id}`);
+    }
+    if (!labels || labels["kuchiclaw.owner"] === undefined) targets.add(id);
+  }
+  return targets;
+}
+
+function parseDockerIds(result: DockerExecResult, operation: string): Set<string> {
+  if (!result.ok) {
+    throw new Error(
+      `Docker reap ${operation} failed; surviving/unverifiable IDs: unknown; ${dockerSummary(result)}`,
+    );
+  }
+  const ids = result.stdout.trim() ? result.stdout.trim().split(/\r?\n/) : [];
+  for (const id of ids) {
+    if (!/^(?:[a-f0-9]{12}|[a-f0-9]{64})$/i.test(id)) {
+      throw new Error(`Docker reap ${operation} returned malformed ID; surviving/unverifiable IDs: ${id}`);
+    }
+  }
+  return new Set(ids);
+}
+
+function dockerSummary(result: DockerExecResult): string {
+  return `ok:${result.ok},timedOut:${result.timedOut},code:${result.code},` +
+    `stderr:${JSON.stringify(result.stderr.slice(0, 300))}`;
+}
+
+async function waitBounded(promise: Promise<void>, timeoutMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = await Promise.race([
+    promise.then(() => false),
+    new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(true), timeoutMs); }),
+  ]);
+  if (timer) clearTimeout(timer);
+  return !timedOut;
+}
+
 export async function main(startupOptions: StartupGateOptions = {}): Promise<void> {
   // Back off inside the process when crash-looping, so systemd's StartLimit
   // never trips the unit into a permanent `failed` state. First thing we do —
@@ -154,105 +260,138 @@ export async function main(startupOptions: StartupGateOptions = {}): Promise<voi
   }
 
   enforceStartupGate(startupOptions);
-  quarantineLooseRootRequests();
+  const instanceLock = await acquireInstanceLock();
 
-  const botToken = process.env.TELEGRAM_BOT_TOKEN;
-  if (!botToken) {
-    console.error("Error: TELEGRAM_BOT_TOKEN environment variable is required.");
-    process.exit(1);
+  try {
+    await preflightDocker();
+    await reapOrchestratorContainers();
+    quarantineLooseRootRequests();
+
+    const botToken = process.env.TELEGRAM_BOT_TOKEN;
+    if (!botToken) {
+      throw new Error("TELEGRAM_BOT_TOKEN environment variable is required.");
+    }
+
+    const { secrets, isApiKeyFallback } = await getSecrets();
+    const mcpServers = loadMcpServers();
+    // Use cheaper model when paying per-token via API key
+    const model = isApiKeyFallback ? "claude-sonnet-4-6" : undefined;
+    const channel = new TelegramChannel(botToken);
+
+    // Register the channel's sendMessage for IPC to use
+    registerSender((chatId, text) => channel.sendMessage(chatId, text));
+
+    const knownGroups = new Set<string>();
+
+    channel.onMessage((msg) => {
+      const group = chatIdToGroup("tg", msg.chatId);
+      try {
+        assertDestinationAllowed(group, group === "main", msg.chatId);
+      } catch (err) {
+        console.error(`[Orchestrator] Refusing message with invalid identity: ${err}`);
+        return;
+      }
+
+      // Log first message from a new group
+      if (!knownGroups.has(group)) {
+        knownGroups.add(group);
+        console.log(`[Orchestrator] New group: ${group} (chat ${msg.chatId})`);
+      }
+
+      // Store user message immediately (before queuing) — starts as "pending"
+      const messageId = insertMessage(group, "user", `[${msg.senderName}] ${msg.text}`, {
+        chatId: msg.chatId,
+        senderName: msg.senderName,
+      });
+
+      console.log(`[Orchestrator] ${msg.senderName} (group: ${group}): "${msg.text.slice(0, 80)}${msg.text.length > 80 ? "..." : ""}"`);
+
+      // Send typing indicator while message waits in queue / runs
+      channel.sendTyping(msg.chatId).catch(() => {});
+
+      enqueue({
+        group,
+        chatId: msg.chatId,
+        senderName: msg.senderName,
+        text: msg.text,
+        secrets,
+        channel,
+        mcpServers,
+        model,
+        attempt: 1,
+        messageId,
+      });
+    });
+
+    let shuttingDown = false;
+    let exitCode = 0;
+    const containmentFailures: string[] = [];
+
+    const requestShutdown = (reason: "signal" | "containment", detail?: Error): void => {
+      if (reason === "containment") {
+        exitCode = 1;
+        const message = detail?.message ?? "container termination could not be confirmed";
+        containmentFailures.push(message);
+        console.error(`[Orchestrator] Containment failure: ${message}`);
+      }
+      if (shuttingDown) return;
+      shuttingDown = true;
+      console.log("\n[Orchestrator] Shutting down...");
+
+      // These calls are deliberately before the first await: no producer or queued
+      // job may advance once containment has been raised.
+      const finished = shutdownQueue();
+      stopPolling();
+      stopScheduler();
+      stopStuckSweep();
+
+      void (async () => {
+        try {
+          await channel.disconnect();
+          const drained = await waitBounded(finished, SHUTDOWN_TIMEOUT_MS);
+          if (!drained) {
+            console.warn(`[Orchestrator] Shutdown timeout (${SHUTDOWN_TIMEOUT_MS}ms) — reaping containers`);
+            try {
+              await reapOrchestratorContainers();
+            } catch (err) {
+              exitCode = 1;
+              console.error(`[Orchestrator] Shutdown reap failed: ${err instanceof Error ? err.message : err}`);
+            }
+            await waitBounded(finished, SHUTDOWN_REAP_DRAIN_MS);
+          }
+        } catch (err) {
+          exitCode = 1;
+          console.error(`[Orchestrator] Shutdown failed: ${err instanceof Error ? err.message : err}`);
+        } finally {
+          await instanceLock.release().catch((err) => {
+            exitCode = 1;
+            console.error(`[Orchestrator] Instance lock release failed: ${err}`);
+          });
+          console.log("[Orchestrator] Goodbye.");
+          process.exit(exitCode);
+        }
+      })();
+    };
+
+    configureLifecycle({
+      owner: "orchestrator",
+      onContainmentFailure: (error) => requestShutdown("containment", error),
+    });
+
+    recoverOrphanedMessages({ secrets, channel, mcpServers, model });
+
+    await channel.connect();
+    startPolling();
+    startScheduler({ secrets, channel, mcpServers, model });
+    startStuckSweep({ secrets, channel, mcpServers, model });
+    console.log("[Orchestrator] KuchiClaw is running. Press Ctrl+C to stop.");
+
+    process.on("SIGINT", () => requestShutdown("signal"));
+    process.on("SIGTERM", () => requestShutdown("signal"));
+  } catch (err) {
+    await instanceLock.release().catch(() => {});
+    throw err;
   }
-
-  const { secrets, isApiKeyFallback } = await getSecrets();
-  const mcpServers = loadMcpServers();
-  // Use cheaper model when paying per-token via API key
-  const model = isApiKeyFallback ? "claude-sonnet-4-6" : undefined;
-  const channel = new TelegramChannel(botToken);
-
-  // Register the channel's sendMessage for IPC to use
-  registerSender((chatId, text) => channel.sendMessage(chatId, text));
-
-  const knownGroups = new Set<string>();
-
-  channel.onMessage((msg) => {
-    const group = chatIdToGroup("tg", msg.chatId);
-    try {
-      assertDestinationAllowed(group, group === "main", msg.chatId);
-    } catch (err) {
-      console.error(`[Orchestrator] Refusing message with invalid identity: ${err}`);
-      return;
-    }
-
-    // Log first message from a new group
-    if (!knownGroups.has(group)) {
-      knownGroups.add(group);
-      console.log(`[Orchestrator] New group: ${group} (chat ${msg.chatId})`);
-    }
-
-    // Store user message immediately (before queuing) — starts as "pending"
-    const messageId = insertMessage(group, "user", `[${msg.senderName}] ${msg.text}`, {
-      chatId: msg.chatId,
-      senderName: msg.senderName,
-    });
-
-    console.log(`[Orchestrator] ${msg.senderName} (group: ${group}): "${msg.text.slice(0, 80)}${msg.text.length > 80 ? "..." : ""}"`);
-
-    // Send typing indicator while message waits in queue / runs
-    channel.sendTyping(msg.chatId).catch(() => {});
-
-    enqueue({
-      group,
-      chatId: msg.chatId,
-      senderName: msg.senderName,
-      text: msg.text,
-      secrets,
-      channel,
-      mcpServers,
-      model,
-      attempt: 1,
-      messageId,
-    });
-  });
-
-  recoverOrphanedMessages({ secrets, channel, mcpServers, model });
-
-  await channel.connect();
-  startPolling();
-  startScheduler({ secrets, channel, mcpServers, model });
-  startStuckSweep({ secrets, channel, mcpServers, model });
-  console.log("[Orchestrator] KuchiClaw is running. Press Ctrl+C to stop.");
-
-  // Graceful shutdown: stop accepting → stop IPC → wait for running containers → exit
-  let shuttingDown = false;
-  const shutdown = async () => {
-    if (shuttingDown) return; // Prevent double-shutdown from rapid signals
-    shuttingDown = true;
-    console.log("\n[Orchestrator] Shutting down...");
-
-    // Stop receiving new messages, IPC polling, scheduler, and the stuck sweep
-    await channel.disconnect();
-    stopPolling();
-    stopScheduler();
-    stopStuckSweep();
-
-    // Wait for running containers to finish, with a hard timeout
-    const finished = shutdownQueue();
-    const timeout = new Promise<void>((resolve) =>
-      setTimeout(() => {
-        console.warn(`[Orchestrator] Shutdown timeout (${SHUTDOWN_TIMEOUT_MS}ms) — forcing exit`);
-        resolve();
-      }, SHUTDOWN_TIMEOUT_MS),
-    );
-
-    await Promise.race([finished, timeout]);
-    // No breaker reset here: the breaker's start-ledger is time-pruned to the same
-    // window systemd counts over, so a clean restart stays in sync with systemd
-    // instead of desyncing it (a reset would let systemd trip on the next crash).
-    console.log("[Orchestrator] Goodbye.");
-    process.exit(0);
-  };
-
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
 }
 
 /**

@@ -25,6 +25,19 @@ export const OUTPUT_END_MARKER = "---KUCHICLAW_OUTPUT_END---";
 /** Container timeout in milliseconds (5 minutes default) */
 export const CONTAINER_TIMEOUT_MS = 5 * 60 * 1000;
 
+/** Maximum time to wait for docker's attach client to flush after termination. */
+export const TERMINATION_DRAIN_MS = 5 * 1000;
+
+/** Container process ceiling. Empty or zero disables the Docker flag. */
+const configuredPidsLimit = process.env.CONTAINER_PIDS_LIMIT;
+export const CONTAINER_PIDS_LIMIT = configuredPidsLimit === "" || configuredPidsLimit === "0"
+  ? undefined
+  : configuredPidsLimit ?? "256";
+
+/** Resource limits are opt-in because aggregate host budgeting is a separate concern. */
+export const CONTAINER_MEMORY = process.env.CONTAINER_MEMORY?.trim() || undefined;
+export const CONTAINER_CPUS = process.env.CONTAINER_CPUS?.trim() || undefined;
+
 /** Max concurrent containers per group (per-group FIFO queue) */
 export const MAX_CONTAINERS_PER_GROUP = 2;
 
@@ -41,6 +54,12 @@ export const DELIVERY_BASE_MS = 1000;
 
 /** Hard timeout for graceful shutdown — kill remaining containers after this (ms) */
 export const SHUTDOWN_TIMEOUT_MS = 60 * 1000;
+
+/** Final bounded wait for close handlers after shutdown reaps live containers. */
+export const SHUTDOWN_REAP_DRAIN_MS = 5 * 1000;
+
+/** Kernel-owned orchestrator singleton backstop. */
+export const INSTANCE_LOCK_PORT = Number.parseInt(process.env.INSTANCE_LOCK_PORT ?? "47671", 10);
 
 /** Directory for IPC request files (containers write here, host polls) */
 export const IPC_DIR = path.join(DATA_DIR, "ipc");

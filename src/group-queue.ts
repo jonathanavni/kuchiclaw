@@ -2,7 +2,8 @@
 // Each group can run up to MAX_CONTAINERS_PER_GROUP containers simultaneously.
 // Jobs within a group execute in FIFO order; across groups, concurrently.
 
-import { runContainer } from "./container-runner.js";
+import { runContainer, type ContainerLifecycle } from "./container-runner.js";
+import { ContainerTerminationUnknownError } from "./container-errors.js";
 import { ensureGroupFolder } from "./group-folder.js";
 import { getSecrets } from "./auth.js";
 import { getRefreshToken } from "./oauth-refresh.js";
@@ -44,6 +45,13 @@ const running = new Map<string, number>();
 
 /** All currently running job promises — used for graceful shutdown */
 const activeJobs = new Set<Promise<void>>();
+
+let lifecycle: ContainerLifecycle = { owner: "orchestrator" };
+
+/** Configure the entrypoint-owned containment notification forwarded to each run. */
+export function configureLifecycle(options: ContainerLifecycle): void {
+  lifecycle = options;
+}
 
 /** Ref-count of live jobs handling each message — the stuck sweep skips these so
  *  it can't re-execute a message that's only slow (deep backlog), not stranded.
@@ -181,12 +189,20 @@ async function executeJob(job: Job): Promise<void> {
   // retry the *container* here; delivery has its own bounded retry in deliver().
   let output;
   try {
-    output = await runContainer(input, paths);
+    output = await runContainer(input, paths, lifecycle);
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     console.error(`[Queue] Container error (attempt ${job.attempt}/${MAX_RETRIES}): ${errMsg}`);
 
-    // Don't retry auth failures — they won't fix themselves on a retry.
+    // Unknown termination is process-level containment; retrying here could put a
+    // second container onto rw mounts still held by the first.
+    if (err instanceof ContainerTerminationUnknownError) {
+      if (job.messageId) updateMessageStatus(job.messageId, "failed");
+      await deliver(channel, chatId, `Container containment error: ${errMsg}`);
+      job.onError?.(errMsg);
+      return;
+    }
+
     if (isAuthError(errMsg)) {
       if (job.messageId) updateMessageStatus(job.messageId, "failed");
       await deliver(channel, chatId, `Authentication error: ${errMsg}`);

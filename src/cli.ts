@@ -105,7 +105,7 @@ export async function main() {
   console.error(`[KuchiClaw] Group: ${group} | Prompt: "${prompt.slice(0, 80)}${prompt.length > 80 ? "..." : ""}"`);
 
   try {
-    const output = await runContainer(input, paths);
+    const output = await runContainer(input, paths, { owner: "cli" });
 
     if (output.status === "success") {
       const result = output.result ?? "(no response)";
