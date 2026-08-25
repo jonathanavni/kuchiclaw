@@ -414,11 +414,13 @@ function makePaths(root: string): GroupPaths {
     ipc: path.join(root, "ipc"),
     skills: path.join(root, "skills"),
     heartbeat: path.join(root, "HEARTBEAT.md"),
+    outRoot: path.join(root, "out"),
   };
   fs.mkdirSync(result.root);
   fs.mkdirSync(result.logs);
   fs.mkdirSync(result.ipc);
   fs.mkdirSync(result.skills);
+  fs.mkdirSync(result.outRoot);
   for (const file of [result.memory, result.context, result.soul, result.tools, result.heartbeat]) {
     fs.writeFileSync(file, "test");
   }

@@ -162,28 +162,37 @@ async function pollNamespace(
   }
 }
 
-/** Read through one descriptor so metadata checks and bytes refer to one object. */
-export function readRequestFile(filePath: string): string {
+/** Read through one descriptor so metadata checks and bytes refer to one object.
+ *  Shared by IPC requests and the container result file — both are
+ *  container-written paths the host must read without following links,
+ *  blocking on FIFOs, or trusting a raceable fstat size. */
+export function readBoundedFile(filePath: string, maxBytes: number, what: string): string {
   const flags = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK;
   const fd = fs.openSync(filePath, flags);
   try {
     const stat = fs.fstatSync(fd);
-    if (!stat.isFile()) throw new Error("IPC request is not a regular file");
-    if (stat.nlink !== 1) throw new Error("IPC request must have exactly one hard link");
-    if (stat.size > MAX_REQUEST_BYTES) throw new Error("IPC request exceeds size limit");
+    if (!stat.isFile()) throw new Error(`${what} is not a regular file`);
+    if (stat.nlink !== 1) throw new Error(`${what} must have exactly one hard link`);
+    if (stat.size > maxBytes) throw new Error(`${what} exceeds size limit`);
 
-    const buffer = Buffer.alloc(MAX_REQUEST_BYTES + 1);
+    // maxBytes+1 probe: fstat's size is raceable against a growing file, so
+    // the authoritative cap is enforced on the bytes actually read.
+    const buffer = Buffer.alloc(maxBytes + 1);
     let total = 0;
     while (total < buffer.length) {
       const bytesRead = fs.readSync(fd, buffer, total, buffer.length - total, null);
       if (bytesRead === 0) break;
       total += bytesRead;
     }
-    if (total > MAX_REQUEST_BYTES) throw new Error("IPC request exceeds size limit");
+    if (total > maxBytes) throw new Error(`${what} exceeds size limit`);
     return buffer.subarray(0, total).toString("utf8");
   } finally {
     fs.closeSync(fd);
   }
+}
+
+export function readRequestFile(filePath: string): string {
+  return readBoundedFile(filePath, MAX_REQUEST_BYTES, "IPC request");
 }
 
 export function quarantineLooseRootRequests(
