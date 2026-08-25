@@ -64,6 +64,8 @@ Same as NanoClaw. The container IS the security boundary. Each agent invocation 
 
 The container image is ~698MB due to the Claude Agent SDK bundle. No browser is needed — the SDK's built-in `WebSearch` and `WebFetch` tools work inside containers.
 
+Since M12, the spawn is hardened (`--init --cap-drop=ALL --security-opt no-new-privileges --pids-limit`, opt-in `--memory`/`--cpus`) and lifecycle-managed: collision-proof names, host-set owner labels, daemon-side kill on timeout, fail-closed reaping of strays at startup and shutdown, and `--mount type=bind` so a missing mount source fails the spawn instead of being silently created. See Phase 12 below.
+
 ### IPC Mechanism
 
 Filesystem-based JSON polling, same as NanoClaw. Each container mounts its **own** per-group namespace `data/ipc/<group>/` at `/workspace/ipc/` — a container can only write into its own directory. The host polls every second, and derives a request's identity from the mount path it arrives on (the directory name **is** the group), never from any field the container writes. It validates each request against authorization rules, executes it, and deletes the file (or quarantines it to `data/ipc-errors/`, outside any container mount, on failure).
@@ -262,6 +264,20 @@ cp /tmp/context-backup.md groups/main/CONTEXT.md
 After this one-time migration, future `git pull` commands won't touch `groups/` at all.
 
 **Key files:** `skills/backup.sh`, `deploy/kuchiclaw-backup.service`, `deploy/kuchiclaw-backup.timer`
+
+### Phase 12: Hardening (M12, in progress)
+
+Post-MVP hardening driven by a cross-model security audit and a study of how NanoClaw's runtime evolved after KuchiClaw forked its patterns. High-risk slices run a full two-model ladder (adversarially reviewed plan → cross-model implementation → three review channels). Shipped so far:
+
+**IPC security boundary.** The shared IPC directory became per-group namespaces: each container mounts only `data/ipc/<group>/`, and the host derives request identity from the *directory a request arrives in* — the payload's `group` field lost all authority. Canonical identity validators (`src/ipc-auth.ts`) run at every consumption point, request files are read via TOCTOU-safe bounded fd reads with symlink rejection, and the error quarantine moved outside any container-mounted tree. A two-factor cutover attestation (filesystem marker + SQLite `user_version`, both outside the legacy trust domain) makes the new binary refuse to boot against a legacy tree.
+
+**Orchestrator resilience.** A file-based startup circuit breaker is the primary crash-loop control (systemd's `StartLimit` is a deliberately loose failsafe); per-job auth failures throw instead of exiting the process; reply delivery is decoupled from the agent run (a Telegram outage can never re-run the agent); a runtime sweep re-enqueues stranded messages with a persisted replay cap.
+
+**Auth lineage.** An explicit `CLAUDE_CODE_OAUTH_TOKEN` (a dedicated `claude setup-token` grant with its own refresh lineage) now outranks `oauth.json`, and the refresh token is never passed alongside an env-token grant — two devices sharing one refresh lineage was the documented root cause of auth crash-loops in this class of deployment.
+
+**Container lifecycle.** A timed-out container is killed by name via the docker daemon (the old client-side SIGKILL provably never reached it) under a `running → terminating → settled` state machine: a stdout-drain latch prevents truncating a late flush, completed-output-at-timeout counts as success (no duplicate re-run), and unconfirmed death is a *containment failure* — the orchestrator settles the job, synchronously closes the queue, and restarts so the startup reap can prove no stray container holds rw mounts. Spawns are labeled and hardened (`--init --cap-drop=ALL --security-opt no-new-privileges --pids-limit`, opt-in memory/cpu caps), mounts use `--mount type=bind` so the daemon atomically rejects missing sources, startup fail-closed-reaps labeled and legacy strays, and a kernel-owned loopback listen socket serves as a single-instance operator backstop.
+
+**Key files:** `src/ipc-auth.ts`, `src/circuit-breaker.ts`, `src/container-runner.ts`, `src/docker.ts`, `src/docker-reap.ts`, `src/instance-lock.ts`, `deploy/cutover-m12-p1.sh`
 
 ### Phase Sequencing Rationale
 
