@@ -358,16 +358,29 @@ describe("runContainer signed-result verification (P5.1)", () => {
     expect(tracked.settlements()).toBe(1);
   });
 
-  it("treats a stdin delivery failure as retryable, not a verification error (Codex F1)", async () => {
-    // A broken stdin pipe means the agent never got its prompt, so no side
-    // effects ran — a re-run is safe. Must NOT become a non-retryable
-    // OutputVerificationError the way a genuine missing result does.
+  it("does not let an async stdin error make a missing result retryable (Codex F1 round-2)", async () => {
+    // A stdin 'error' can fire late (teardown after a full run), so it must not
+    // flip a container-started no-result outcome to retryable — that could
+    // duplicate side effects. Stays a non-retryable OutputVerificationError.
     const tracked = track(runContainer(input(), paths, { owner: "orchestrator" }));
     proc.stdin.emit("error", new Error("EPIPE"));
     proc.emit("close", 1);
 
-    await expect(tracked.promise).rejects.toThrow(/delivery failed/);
-    await expect(tracked.promise).rejects.not.toBeInstanceOf(OutputVerificationError);
+    await expect(tracked.promise).rejects.toBeInstanceOf(OutputVerificationError);
+    expect(tracked.settlements()).toBe(1);
+  });
+
+  it("kills the container on a synchronous stdin write throw (no stray, non-retryable)", async () => {
+    // A sync throw leaves a spawned container that would hang on an EOF we never
+    // sent; it must be killed+confirmed, and the outcome is non-retryable so the
+    // queue never re-runs onto its live mounts.
+    proc.stdin.write.mockImplementationOnce(() => { throw new Error("stream destroyed"); });
+    const tracked = track(runContainer(input(), paths, { owner: "orchestrator" }));
+    // The sync throw routes to termination; advance past the drain latch.
+    await vi.advanceTimersByTimeAsync(50);
+
+    await expect(tracked.promise).rejects.toBeInstanceOf(OutputVerificationError);
+    expect(docker.execDocker).toHaveBeenCalledWith(["kill", expect.stringContaining("kuchiclaw-tg-123")]);
     expect(tracked.settlements()).toBe(1);
   });
 
