@@ -36,7 +36,7 @@ mv "$tmp" "${tmp%.tmp}.json"
 - Use unique filenames (timestamp-based) to avoid collisions
 - Always write a `.tmp` file completely and then rename it to `.json`; the host ignores non-JSON files
 - The file is deleted after processing; failed requests are quarantined by the host
-- Your chat ID is in the **Session Context** section of your system prompt
+- Your chat ID, the current time, and your timezone are in the **Session Context** section of your system prompt
 - **Scoping:** Non-main groups can only message their own chat and manage their own tasks. The `main` group has full access to all chats and tasks.
 
 **Create a scheduled task:**
@@ -56,7 +56,7 @@ mv "$tmp" "${tmp%.tmp}.json"
 ```
 
 Schedule types:
-- `cron` — cron expression (e.g., `"0 */6 * * *"` for every 6 hours). Times are UTC.
+- `cron` — cron expression (e.g., `"0 */6 * * *"` for every 6 hours). **Cron expressions are interpreted in the timezone shown in your Session Context** — write the local wall-clock time you want (e.g. `"0 8 * * *"` = 8 AM local), do not pre-convert to UTC. On a DST transition day a firing may shift or skip; that is expected.
 - `interval` — milliseconds between runs (e.g., `"3600000"` for 1 hour)
 - `once` — ISO 8601 timestamp for a one-shot task (e.g., `"2026-03-15T10:00:00Z"`)
 
