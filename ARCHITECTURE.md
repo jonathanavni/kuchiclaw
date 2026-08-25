@@ -135,7 +135,7 @@ Claude Max OAuth token with automatic refresh. Auth resolution priority:
 3. **`CLAUDE_CODE_OAUTH_TOKEN` env var** — static token override.
 4. **macOS keychain** — local dev only. Claude Code stores credentials in `Claude Code-credentials` keychain entry.
 
-Tokens are passed to containers via stdin — never mounted as files. Skill-specific secrets (e.g., `FASTMAIL_API_TOKEN`) flow through the same stdin mechanism.
+Tokens are passed to containers via stdin — never mounted as files. Skill-specific secrets (e.g., `FASTMAIL_API_TOKEN`) flow through the same stdin mechanism, scoped per group: only containers of groups listed in `FASTMAIL_GROUPS` receive the token (unset = no group does). Inside the container, the refresh token is used and scrubbed before the agent starts — the agent-visible env holds only allowlisted, short-lived or entitled keys.
 
 ---
 
@@ -277,7 +277,9 @@ Post-MVP hardening driven by a cross-model security audit and a study of how Nan
 
 **Container lifecycle.** A timed-out container is killed by name via the docker daemon (the old client-side SIGKILL provably never reached it) under a `running → terminating → settled` state machine: a stdout-drain latch prevents truncating a late flush, completed-output-at-timeout counts as success (no duplicate re-run), and unconfirmed death is a *containment failure* — the orchestrator settles the job, synchronously closes the queue, and restarts so the startup reap can prove no stray container holds rw mounts. Spawns are labeled and hardened (`--init --cap-drop=ALL --security-opt no-new-privileges --pids-limit`, opt-in memory/cpu caps), mounts use `--mount type=bind` so the daemon atomically rejects missing sources, startup fail-closed-reaps labeled and legacy strays, and a kernel-owned loopback listen socket serves as a single-instance operator backstop.
 
-**Key files:** `src/ipc-auth.ts`, `src/circuit-breaker.ts`, `src/container-runner.ts`, `src/docker.ts`, `src/docker-reap.ts`, `src/instance-lock.ts`, `deploy/cutover-m12-p1.sh`
+**Secret scoping.** The agent inside a container is treated as untrusted (prompt injection via messages, web content, or email is assumed), so long-lived credentials are kept out of its reach. The container entrypoint applies an *exact allowlist* of agent-visible env keys and refuses any secret whose value equals the OAuth refresh token — the refresh token is refreshed (with response validation) and scrubbed from the input before the SDK starts, so it is never agent-readable under any key or as any value; refusals surface as structured output warnings the host logs (bounded and sanitized). Skill secrets are explicit-entitlement only: `FASTMAIL_GROUPS` names the groups whose containers receive the Fastmail token (unset means none — fail-closed), validated by the same group-name validators as IPC. The entrypoint's full flow is exported as an injectable function (`runEntrypoint`) so host tests drive the real code path and assert the credential boundary at the exact moment the SDK is invoked. One documented dependency: heap-level isolation of the in-process refresh token relies on the host's `kernel.yama.ptrace_scope=1` (Ubuntu default) combined with `--cap-drop=ALL` — deployments on hosts with `ptrace_scope=0` lose that barrier.
+
+**Key files:** `src/ipc-auth.ts`, `src/circuit-breaker.ts`, `src/container-runner.ts`, `src/docker.ts`, `src/docker-reap.ts`, `src/instance-lock.ts`, `deploy/cutover-m12-p1.sh`, `container/prepare.ts`
 
 ### Phase Sequencing Rationale
 
@@ -293,7 +295,7 @@ Post-MVP hardening driven by a cross-model security audit and a study of how Nan
 
 - **Containers are the security boundary** — agents see only mounted directories
 - **Read-only mounts by default** — MEMORY.md and CONTEXT.md are the exceptions
-- **Secrets via stdin, never files** — auth tokens and API keys passed through ContainerInput, set as env vars inside the container
+- **Secrets via stdin, never files** — auth tokens and API keys passed through ContainerInput; the container sets only an exact allowlist of keys into the agent's env, the OAuth refresh token is never agent-visible, and skill secrets reach only groups entitled via `FASTMAIL_GROUPS`
 - **IPC authorization** — every request validated before execution. Non-main groups scoped to own data
 - **Non-root container user** — Claude Code refuses `bypassPermissions` as root
 - **No personal account credentials** — dedicated service accounts only
