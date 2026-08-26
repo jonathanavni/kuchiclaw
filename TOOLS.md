@@ -204,7 +204,7 @@ Key files and directories mounted in your workspace:
 - `HEARTBEAT.md` — Self-maintenance checklist (read-only). Follow this when running as a heartbeat task.
 - `MEMORY.md` — Your long-term memory (read-write). Update this with durable facts.
 - `CONTEXT.md` — Session scratchpad (read-write). Use for working notes.
-- `TODO.md` — This group's shared to-do list (read-write). Unlike MEMORY.md it is NOT part of your prompt — read the file when someone asks about the list, and edit it when they add, complete, or remove items. Keep the checklist format (`- [ ]` open, `- [x]` done); move done items to a `## Done` section rather than deleting them, and prune that section when it gets long. Don't duplicate the list into MEMORY.md.
+- `TODO.md` — This group's shared to-do list (read-write). Unlike MEMORY.md it is NOT part of your prompt — read the file when someone asks about the list, and edit it when they add, complete, or remove items. Keep the checklist format (`- [ ]` open, `- [x]` done); move done items to a `## Done` section rather than deleting them, and prune that section when it gets long. Items may carry an optional deadline as `(due: YYYY-MM-DD)` at the end of the line — add one when the requester gives a date, and keep the ISO format so deadlines stay comparable. Don't duplicate the list into MEMORY.md.
 - `ipc/` — Write JSON files here to trigger host-side actions (see IPC section)
 - `skills/` — CLI scripts and tools (read-only, see Skills section)
 
