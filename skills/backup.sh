@@ -104,7 +104,7 @@ git pull --ff-only origin main 2>/dev/null || true
 # Copy living files (preserve directory structure)
 if [ -d "$GROUPS_DIR" ]; then
   # Copy all MEMORY.md and CONTEXT.md files, preserving group folder structure
-  find "$GROUPS_DIR" -name "MEMORY.md" -o -name "CONTEXT.md" | while read -r f; do
+  find "$GROUPS_DIR" -name "MEMORY.md" -o -name "CONTEXT.md" -o -name "TODO.md" | while read -r f; do
     # Get relative path from groups/ (e.g., main/MEMORY.md)
     rel="${f#$GROUPS_DIR/}"
     mkdir -p "$MEMORY_REPO/groups/$(dirname "$rel")"

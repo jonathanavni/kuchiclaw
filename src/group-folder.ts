@@ -13,6 +13,9 @@ export interface GroupPaths {
   memory: string;
   /** Per-group session scratchpad */
   context: string;
+  /** Per-group shared to-do list — rw-mounted but NOT prompt-injected: the
+   *  agent reads/writes it on demand, so an idle list costs zero context. */
+  todo: string;
   /** Container log directory */
   logs: string;
   /** Global SOUL.md (read-only, shared across groups) */
@@ -41,6 +44,7 @@ export function ensureGroupFolder(groupName: string): GroupPaths {
     root,
     memory: path.join(root, "MEMORY.md"),
     context: path.join(root, "CONTEXT.md"),
+    todo: path.join(root, "TODO.md"),
     logs: path.join(root, "logs"),
     soul: path.join(PROJECT_ROOT, "SOUL.md"),
     tools: path.join(PROJECT_ROOT, "TOOLS.md"),
@@ -69,6 +73,11 @@ export function ensureGroupFolder(groupName: string): GroupPaths {
   // Seed CONTEXT.md if it doesn't exist
   if (!fs.existsSync(paths.context)) {
     fs.writeFileSync(paths.context, "# Context\n\nSession scratchpad.\n");
+  }
+
+  // Seed TODO.md if it doesn't exist
+  if (!fs.existsSync(paths.todo)) {
+    fs.writeFileSync(paths.todo, "# To-do\n\n<!-- Checklist items: - [ ] open, - [x] done -->\n");
   }
 
   return paths;

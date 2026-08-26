@@ -366,6 +366,7 @@ kuchiclaw/
 │   └── main/                       # Created by ensureGroupFolder() (gitignored)
 │       ├── MEMORY.md               # Long-lived curated facts (per-group, rw)
 │       ├── CONTEXT.md              # Session working memory (per-group, rw)
+│       ├── TODO.md                 # Shared to-do list (per-group, rw, not prompt-injected)
 │       └── logs/
 ├── deploy/
 │   ├── setup.sh                    # VPS provisioning script

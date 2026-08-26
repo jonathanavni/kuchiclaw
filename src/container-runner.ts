@@ -229,6 +229,7 @@ function buildMountArgs(paths: GroupPaths, runDir: string): string[] {
     [paths.tools, "/workspace/TOOLS.md", true],
     [paths.memory, "/workspace/MEMORY.md", false],
     [paths.context, "/workspace/CONTEXT.md", false],
+    [paths.todo, "/workspace/TODO.md", false],
     [paths.ipc, "/workspace/ipc", false],
     [paths.skills, "/workspace/skills", true],
     [runDir, CONTAINER_OUTPUT_DIR, false],

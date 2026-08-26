@@ -481,7 +481,7 @@ describe("runContainer argv", () => {
     ]) {
       expect(mountFor(destination)).toContain(",readonly");
     }
-    for (const destination of ["/workspace/MEMORY.md", "/workspace/CONTEXT.md", "/workspace/ipc", "/workspace/.out"]) {
+    for (const destination of ["/workspace/MEMORY.md", "/workspace/CONTEXT.md", "/workspace/TODO.md", "/workspace/ipc", "/workspace/.out"]) {
       expect(mountFor(destination)).toBeDefined();
       expect(mountFor(destination)).not.toContain(",readonly");
     }
@@ -558,6 +558,7 @@ function makePaths(root: string): GroupPaths {
     root: path.join(root, "group"),
     memory: path.join(root, "MEMORY.md"),
     context: path.join(root, "CONTEXT.md"),
+    todo: path.join(root, "TODO.md"),
     logs: path.join(root, "logs"),
     soul: path.join(root, "SOUL.md"),
     tools: path.join(root, "TOOLS.md"),
@@ -571,7 +572,7 @@ function makePaths(root: string): GroupPaths {
   fs.mkdirSync(result.ipc);
   fs.mkdirSync(result.skills);
   fs.mkdirSync(result.outRoot);
-  for (const file of [result.memory, result.context, result.soul, result.tools, result.heartbeat]) {
+  for (const file of [result.memory, result.context, result.todo, result.soul, result.tools, result.heartbeat]) {
     fs.writeFileSync(file, "test");
   }
   return result;
