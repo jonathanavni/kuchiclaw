@@ -1,98 +1,225 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
 import { CronExpressionParser } from "cron-parser";
-import {
-  resetDb,
-  insertTask,
-  updateTaskNextRun,
-  updateTaskStatus,
-  getDueTasks,
-  getTasksByGroup,
-} from "./db.js";
+
+const enqueue = vi.hoisted(() => vi.fn());
+vi.mock("./group-queue.js", () => ({ enqueue }));
+// Pin the cron timezone: AGENT_TIMEZONE is env-derived, and a developer .env
+// with a non-UTC zone would shift every expected instant below.
+vi.mock("./config.js", async (importActual) => ({
+  ...(await importActual<typeof import("./config.js")>()),
+  AGENT_TIMEZONE: "UTC",
+}));
+
+import { SCHEDULER_POLL_MS } from "./config.js";
+import { getDb, getTasksByGroup, insertTask, resetDb, updateTaskNextRun } from "./db.js";
+import { advanceNextRun, resetSchedulerForTest, startScheduler } from "./task-scheduler.js";
+import type { Channel } from "./channels/registry.js";
+import type { ScheduledTask } from "./types.js";
+
+// Fixed "now" so every assertion is deterministic — injected via SchedulerDeps.now.
+const NOW = new Date("2026-08-26T12:00:00.000Z").getTime();
+
+function schedulerDeps() {
+  return { secrets: {}, channel: {} as Channel, now: () => NOW };
+}
+
+function insertActive(
+  scheduleType: "cron" | "interval" | "once",
+  scheduleValue: string,
+  nextRun: string,
+): number {
+  return insertTask("tg-123", "123", "prompt", scheduleType, scheduleValue, nextRun);
+}
+
+function taskById(id: number): ScheduledTask {
+  const task = getTasksByGroup("tg-123").find((t) => t.id === id);
+  if (!task) throw new Error(`task ${id} not found`);
+  return task;
+}
 
 beforeEach(() => {
   resetDb(new Database(":memory:"));
+  resetSchedulerForTest();
+  enqueue.mockClear();
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  vi.spyOn(console, "log").mockImplementation(() => {});
 });
 
-describe("interval drift prevention", () => {
-  it("advances next_run from previous scheduled time, not now", () => {
-    // Task was supposed to run at 10:00, interval is 1 hour
-    const scheduledTime = "2026-03-12T10:00:00.000Z";
-    const intervalMs = 3600_000; // 1 hour
+afterEach(() => {
+  resetSchedulerForTest();
+  vi.restoreAllMocks();
+});
 
-    // Simulate: advance from scheduled time, not Date.now()
-    const next = new Date(new Date(scheduledTime).getTime() + intervalMs).toISOString();
-    expect(next).toBe("2026-03-12T11:00:00.000Z");
+describe("poll() end-to-end: cron catch-up after downtime", () => {
+  it("fires a multi-day-stale daily cron exactly once and lands next_run in the future", () => {
+    // Daily at 09:00 UTC, last scheduled 3 days ago — pre-P7 this replayed
+    // once per poll for every missed day.
+    const id = insertActive("cron", "0 9 * * *", "2026-08-23T09:00:00.000Z");
+    startScheduler(schedulerDeps());
+
+    expect(enqueue).toHaveBeenCalledTimes(1);
+    const after = taskById(id);
+    expect(after.status).toBe("active");
+    // Next occurrence strictly after NOW (12:00Z): tomorrow 09:00, not 08-24.
+    expect(after.next_run).toBe("2026-08-27T09:00:00.000Z");
+
+    // A second poll immediately after must not re-fire (nothing due).
+    enqueue.mockClear();
+    resetSchedulerForTest();
+    startScheduler(schedulerDeps());
+    expect(enqueue).not.toHaveBeenCalled();
   });
 
-  it("skips forward if fallen behind", () => {
-    // Task was supposed to run at 10:00, but it's now 12:30. Interval = 1h.
-    // Should skip to 13:00, not 11:00.
-    const scheduledTime = "2026-03-12T10:00:00.000Z";
-    const intervalMs = 3600_000;
-    const now = new Date("2026-03-12T12:30:00.000Z").getTime();
+  it("preserves drift anchoring when the task is due on time", () => {
+    // Due exactly now: anchor == now, next comes from the schedule, not from
+    // poll jitter.
+    const id = insertActive("cron", "0 12 * * *", "2026-08-26T12:00:00.000Z");
+    startScheduler(schedulerDeps());
 
-    let next = new Date(scheduledTime).getTime() + intervalMs;
-    while (next <= now) next += intervalMs;
-
-    expect(new Date(next).toISOString()).toBe("2026-03-12T13:00:00.000Z");
-  });
-
-  it("handles exact boundary (next_run + interval === now)", () => {
-    const scheduledTime = "2026-03-12T10:00:00.000Z";
-    const intervalMs = 3600_000;
-    const now = new Date("2026-03-12T11:00:00.000Z").getTime();
-
-    let next = new Date(scheduledTime).getTime() + intervalMs;
-    while (next <= now) next += intervalMs;
-
-    // At exact boundary, should advance one more interval
-    expect(new Date(next).toISOString()).toBe("2026-03-12T12:00:00.000Z");
+    expect(enqueue).toHaveBeenCalledTimes(1);
+    expect(taskById(id).next_run).toBe("2026-08-27T12:00:00.000Z");
   });
 });
 
-describe("cron next_run computation", () => {
-  it("computes next run for a simple cron expression", () => {
-    const expr = CronExpressionParser.parse("0 */6 * * *", {
-      currentDate: new Date("2026-03-12T10:00:00Z"),
-      tz: "UTC",
+describe("advanceNextRun (exported unit)", () => {
+  it("interval: skips forward past missed occurrences from the stored anchor", () => {
+    const hour = 3_600_000;
+    // Anchored 2.5 intervals in the past → next lands 0.5 intervals ahead.
+    const anchor = new Date(NOW - 2.5 * hour).toISOString();
+    const id = insertActive("interval", String(hour), anchor);
+
+    expect(advanceNextRun(taskById(id), NOW)).toBe(true);
+    expect(new Date(taskById(id).next_run).getTime()).toBe(NOW + 0.5 * hour);
+  });
+
+  it("interval: exact boundary (next === now) advances one more step", () => {
+    const hour = 3_600_000;
+    const anchor = new Date(NOW - hour).toISOString(); // anchor + ms === NOW
+    const id = insertActive("interval", String(hour), anchor);
+
+    advanceNextRun(taskById(id), NOW);
+    // `next <= now` must advance again — flipping <= to < double-fires.
+    expect(new Date(taskById(id).next_run).getTime()).toBe(NOW + hour);
+  });
+
+  it.each([
+    ["non-numeric", "abc"],
+    ["negative", "-5"],
+    ["zero", "0"],
+    ["trailing garbage parseInt would accept", "5000abc"],
+    ["non-integer", "1000.5"],
+  ])("interval: %s value pauses the task and returns false", (_label, value) => {
+    const id = insertActive("interval", value, "2026-08-26T11:00:00.000Z");
+    expect(advanceNextRun(taskById(id), NOW)).toBe(false);
+    expect(taskById(id).status).toBe("paused");
+  });
+
+  it("interval: malformed next_run anchor pauses instead of throwing", () => {
+    const id = insertActive("interval", "1000", "2026-08-26T11:00:00.000Z");
+    updateTaskNextRun(id, "not-a-date");
+    expect(advanceNextRun(taskById(id), NOW)).toBe(false);
+    expect(taskById(id).status).toBe("paused");
+  });
+
+  it("cron: invalid expression pauses the task and returns false", () => {
+    const id = insertActive("cron", "not a cron", "2026-08-26T11:00:00.000Z");
+    expect(advanceNextRun(taskById(id), NOW)).toBe(false);
+    expect(taskById(id).status).toBe("paused");
+  });
+
+  it("cron: a slightly-future anchor stays the anchor (no drift reset)", () => {
+    // next_run a minute ahead of now (clock skew): anchor wins over now.
+    const id = insertActive("cron", "0 9 * * *", "2026-08-26T12:01:00.000Z");
+    expect(advanceNextRun(taskById(id), NOW)).toBe(true);
+    expect(taskById(id).next_run).toBe("2026-08-27T09:00:00.000Z");
+  });
+
+  it("once: marks completed via the real path", () => {
+    const id = insertActive("once", "2026-08-26T11:00:00.000Z", "2026-08-26T11:00:00.000Z");
+    expect(advanceNextRun(taskById(id), NOW)).toBe(true);
+    expect(taskById(id).status).toBe("completed");
+  });
+});
+
+describe("poll() invalid-input handling (P7: paused tasks must not run)", () => {
+  it.each([
+    ["cron", "not a cron"],
+    ["interval", "abc"],
+  ] as const)("a due %s task with an invalid schedule is paused WITHOUT enqueue", (type, value) => {
+    const id = insertActive(type, value, "2026-08-26T11:00:00.000Z");
+    startScheduler(schedulerDeps());
+
+    // Pre-P7 the task was paused but still ran once (enqueue after pause).
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(taskById(id).status).toBe("paused");
+  });
+
+  it("a valid task still runs when an earlier task's enqueue throws", () => {
+    insertActive("once", "x", "2026-08-26T10:00:00.000Z");
+    insertActive("once", "x", "2026-08-26T11:00:00.000Z");
+    enqueue.mockImplementationOnce(() => { throw new Error("queue closed"); });
+    startScheduler(schedulerDeps());
+
+    expect(enqueue).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("poll() ordering and in-flight dedup", () => {
+  it("advances next_run BEFORE enqueue (at-most-once claim ordering)", () => {
+    const id = insertActive("cron", "0 9 * * *", "2026-08-26T09:00:00.000Z");
+    let nextRunAtEnqueue = "";
+    enqueue.mockImplementationOnce(() => {
+      nextRunAtEnqueue = taskById(id).next_run;
     });
-    const next = expr.next().toDate().toISOString();
-    expect(next).toBe("2026-03-12T12:00:00.000Z");
+    startScheduler(schedulerDeps());
+
+    // The occurrence was claimed (next_run advanced) before the job existed.
+    expect(nextRunAtEnqueue).toBe("2026-08-27T09:00:00.000Z");
   });
 
-  it("wraps to next day when no more matches today", () => {
-    const expr = CronExpressionParser.parse("0 8 * * *", {
-      currentDate: new Date("2026-03-12T09:00:00Z"),
-      tz: "UTC",
-    });
-    const next = expr.next().toDate().toISOString();
-    // 8am already passed (current is 9am), next is tomorrow 8am
-    expect(next).toBe("2026-03-13T08:00:00.000Z");
+  it("skips a still-in-flight task on later polls, then re-fires after completion", () => {
+    vi.useFakeTimers();
+    try {
+      // Mutable clock: each poll sees a later "now" so the 1s-interval task is
+      // always due again by the next poll.
+      let clock = NOW;
+      const id = insertActive("interval", "1000", "2026-08-26T11:59:00.000Z");
+      startScheduler({ secrets: {}, channel: {} as Channel, now: () => clock });
+      expect(enqueue).toHaveBeenCalledTimes(1);
+
+      // Next poll: task due again, but the first run hasn't completed → skipped.
+      clock += SCHEDULER_POLL_MS;
+      vi.advanceTimersByTime(SCHEDULER_POLL_MS);
+      expect(enqueue).toHaveBeenCalledTimes(1);
+
+      // Completion clears in-flight; the next poll fires it again.
+      enqueue.mock.calls[0][0].onComplete("done");
+      clock += SCHEDULER_POLL_MS;
+      vi.advanceTimersByTime(SCHEDULER_POLL_MS);
+      expect(enqueue).toHaveBeenCalledTimes(2);
+
+      const logs = getDb().prepare("SELECT * FROM task_run_logs WHERE task_id = ?").all(id);
+      expect(logs).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
-  it("rejects invalid cron expressions", () => {
-    expect(() => CronExpressionParser.parse("not a cron")).toThrow();
-  });
-});
+  it("writes success and error run logs via the job callbacks", () => {
+    const id = insertActive("once", "x", "2026-08-26T11:00:00.000Z");
+    startScheduler(schedulerDeps());
+    const job = enqueue.mock.calls[0][0];
 
-describe("one-shot tasks", () => {
-  it("one-shot task is due when next_run is in the past", () => {
-    insertTask("main", "chat1", "do once", "once", "2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z");
-    const due = getDueTasks(new Date().toISOString());
-    expect(due).toHaveLength(1);
-  });
-
-  it("one-shot task should be marked completed after execution", () => {
-    const id = insertTask("main", "chat1", "do once", "once", "2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z");
-    // Simulate what advanceNextRun does for one-shot
-    updateTaskStatus(id, "completed");
-
-    const due = getDueTasks(new Date().toISOString());
-    expect(due).toHaveLength(0);
-
-    const all = getTasksByGroup("main");
-    expect(all[0].status).toBe("completed");
+    job.onComplete("all good");
+    job.onError("boom");
+    const logs = getDb()
+      .prepare("SELECT status, result, error FROM task_run_logs WHERE task_id = ? ORDER BY id")
+      .all(id) as Array<{ status: string; result: string | null; error: string | null }>;
+    expect(logs).toEqual([
+      { status: "success", result: "all good", error: null },
+      { status: "error", result: null, error: "boom" },
+    ]);
   });
 });
 

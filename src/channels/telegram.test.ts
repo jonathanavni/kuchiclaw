@@ -187,6 +187,34 @@ describe("sendChunked (round-1 F2: per-chunk delivery)", () => {
     warn.mockRestore();
   });
 
+  it("parse-400 then transient failure on the SAME chunk retries the plain fallback, not chunk 1 (round-2 F4)", async () => {
+    const c = collector();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const sleeps: number[] = [];
+    let htmlCall = 0;
+    const htmlParseFailOnSecond = vi.fn(async (h: string) => {
+      htmlCall++;
+      if (htmlCall === 2) throw { response: { body: { error_code: 400, description: "can't parse entities" } } };
+      c.sent.push({ mode: "html", text: h });
+    });
+    let plainCall = 0;
+    const plainFlaky = vi.fn(async (p: string) => {
+      plainCall++;
+      if (plainCall === 1) throw { response: { body: { error_code: 429, description: "flood", parameters: { retry_after: 3 } } } };
+      c.sent.push({ mode: "plain", text: p });
+    });
+
+    await sendChunked(twoChunkText, htmlParseFailOnSecond, plainFlaky, {
+      maxLen: 200, sleep: async (ms) => { sleeps.push(ms); },
+    });
+    const chunks = splitMessage(twoChunkText, 200);
+    // Chunk 1 delivered exactly once; chunk 2's fallback retried in place.
+    expect(c.sent.filter((s) => s.text === markdownToHtml(chunks[0]))).toHaveLength(1);
+    expect(c.sent.at(-1)).toEqual({ mode: "plain", text: chunks[1] });
+    expect(sleeps).toEqual([3000]); // retry_after honored on the plain retry
+    warn.mockRestore();
+  });
+
   it("throws only after per-chunk retries exhaust, honoring retry_after backoff", async () => {
     const sleeps: number[] = [];
     const alwaysFail = vi.fn(async () => {
