@@ -250,10 +250,75 @@ describe("signed result transport (P5.1)", () => {
   });
 });
 
-it("uses a nonzero production exit code only for crash-level errors", () => {
-  expect(getProductionExitCode({ status: "error", error: "Container crashed: boom" })).toBe(1);
-  expect(getProductionExitCode({ status: "error", error: "Agent stopped: failure" })).toBe(0);
+it("uses a nonzero production exit code only for typed entrypoint crashes", () => {
+  expect(getProductionExitCode({ status: "error", errorKind: "container_crash" })).toBe(1);
+  expect(getProductionExitCode({ status: "error", errorKind: "auth" })).toBe(0);
+  expect(getProductionExitCode({ status: "error", errorKind: "other" })).toBe(0);
   expect(getProductionExitCode({ status: "success" })).toBe(0);
+});
+
+describe("typed error envelopes", () => {
+  it.each([
+    ["authentication_failed", "auth"],
+    ["rate_limit", "rate_limit"],
+  ] as const)("maps assistant error %s to %s", async (assistantError, expectedKind) => {
+    const output = await runEntrypoint(rawInput(), {
+      env: {},
+      query: () => (async function* () {
+        yield {
+          type: "assistant",
+          error: assistantError,
+          message: { content: [] },
+        };
+        yield {
+          type: "result",
+          subtype: "error_during_execution",
+          errors: ["ambiguous failure"],
+        };
+      })(),
+    });
+
+    expect(output).toMatchObject({ status: "error", errorKind: expectedKind });
+    expect(getProductionExitCode(output)).toBe(0);
+  });
+
+  it("classifies result errors arrays while preserving SDK-error exit zero", async () => {
+    const output = await runEntrypoint(rawInput(), {
+      env: {},
+      query: () => (async function* () {
+        yield {
+          type: "result",
+          subtype: "error_during_execution",
+          errors: ["Request failed: too many requests (429)"],
+        };
+      })(),
+    });
+
+    expect(output).toMatchObject({ status: "error", errorKind: "rate_limit" });
+    expect(getProductionExitCode(output)).toBe(0);
+  });
+
+  it("keeps an ambiguous SDK error as other with exit zero", async () => {
+    const output = await runEntrypoint(rawInput(), {
+      env: {},
+      query: () => (async function* () {
+        yield { type: "result", subtype: "error_during_execution", errors: ["request failed"] };
+      })(),
+    });
+
+    expect(output).toMatchObject({ status: "error", errorKind: "other" });
+    expect(getProductionExitCode(output)).toBe(0);
+  });
+
+  it("marks only a caught entrypoint failure as container_crash with exit one", async () => {
+    const output = await runEntrypoint("not-json", {
+      env: {},
+      query: snapshottingSuccessfulQuery({}),
+    });
+
+    expect(output).toMatchObject({ status: "error", errorKind: "container_crash" });
+    expect(getProductionExitCode(output)).toBe(1);
+  });
 });
 
 function rawInput(

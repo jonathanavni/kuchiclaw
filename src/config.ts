@@ -86,6 +86,9 @@ export const IPC_ERRORS_DIR = path.join(DATA_DIR, "ipc-errors");
 /** Filesystem half of the IPC layout attestation; containers never mount this path. */
 export const IPC_LAYOUT_MARKER = path.join(DATA_DIR, "ipc-layout-v2");
 
+/** Provenance marker for an in-progress fresh-install attestation protocol. */
+export const INIT_PENDING_SENTINEL = path.join(DATA_DIR, "init-pending");
+
 /** Maximum accepted IPC request size, excluding the one-byte overflow probe. */
 export const MAX_REQUEST_BYTES = 64 * 1024;
 
@@ -110,6 +113,33 @@ export const STUCK_SWEEP_MS = 5 * 60_000;
 /** A 'processing' message older than this (s) has no live job — the sweep re-enqueues it.
  *  Must exceed the container timeout by a comfortable margin so live jobs are never swept. */
 export const STUCK_THRESHOLD_SEC = 15 * 60;
+
+/** Retention (P7): age limits for terminal rows/quarantine files. 0 disables that pruner. */
+export const MESSAGES_RETENTION_DAYS = parseRetentionDaysEnv("MESSAGES_RETENTION_DAYS", 30);
+export const TASK_RUN_LOGS_RETENTION_DAYS = parseRetentionDaysEnv("TASK_RUN_LOGS_RETENTION_DAYS", 30);
+export const IPC_ERRORS_RETENTION_DAYS = parseRetentionDaysEnv("IPC_ERRORS_RETENTION_DAYS", 30);
+
+/** Newest messages always kept per group regardless of age — a belt over the
+ *  history reader's LIMIT 20 and the 1h recovery window. */
+export const MESSAGES_KEEP_NEWEST = 50;
+
+/** Daily retention sweep interval (ms). */
+export const RETENTION_SWEEP_MS = 24 * 60 * 60_000;
+
+/** A 'pending' message past this age (s) is unreachable by any recovery path —
+ *  matches getOrphanedMessages' upper window; startup terminalizes it. */
+export const STRANDED_PENDING_MAX_AGE_SEC = 3600;
+
+function parseRetentionDaysEnv(name: string, fallback: number): number {
+  const configured = process.env[name];
+  if (configured === undefined || configured === "") return fallback;
+  if (/^\d+$/.test(configured)) {
+    const value = Number(configured);
+    if (Number.isSafeInteger(value) && value >= 0 && value <= 3650) return value;
+  }
+  console.warn(`[Config] Invalid ${name}=${JSON.stringify(configured)}; using default ${fallback}`);
+  return fallback;
+}
 
 /** Max times a message may be re-enqueued by recovery/sweep before it's failed permanently. */
 export const MAX_RECOVERY_ATTEMPTS = 3;

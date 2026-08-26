@@ -92,6 +92,7 @@ export interface ContainerOutput {
   status: "success" | "error";
   result?: string;
   error?: string;
+  errorKind?: "auth" | "rate_limit" | "max_turns" | "container_crash" | "other";
   /** Refused secret names surfaced to the host even when the run succeeds. */
   warnings?: string[];
   /** Fresh OAuth tokens if the container refreshed them — host persists these to oauth.json */

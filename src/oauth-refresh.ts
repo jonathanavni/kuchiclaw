@@ -7,10 +7,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { DATA_DIR } from "./config.js";
 
-const OAUTH_PATH = path.join(DATA_DIR, "oauth.json");
+let oauthPath = path.join(DATA_DIR, "oauth.json");
 
 // Refresh 5 minutes before expiry to avoid mid-request failures
 const REFRESH_BUFFER_MS = 5 * 60 * 1000;
+
+/** Sanity ceiling for provider-supplied expires_in (seconds). */
+const MAX_EXPIRES_IN_SEC = 365 * 24 * 3600;
 
 const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -29,10 +32,18 @@ let cached: OAuthData | null = null;
  *  they can't clobber each other's token via racing writes. */
 let refreshInFlight: Promise<OAuthData | null> | null = null;
 
+/** Test seam: point the module at a scratch oauth.json and clear all module
+ *  state (path, cache, single-flight promise) — the resetDb() convention. */
+export function resetOAuthForTest(pathOverride?: string): void {
+  oauthPath = pathOverride ?? path.join(DATA_DIR, "oauth.json");
+  cached = null;
+  refreshInFlight = null;
+}
+
 function loadFromDisk(): OAuthData | null {
   try {
-    if (!fs.existsSync(OAUTH_PATH)) return null;
-    const raw = JSON.parse(fs.readFileSync(OAUTH_PATH, "utf-8"));
+    if (!fs.existsSync(oauthPath)) return null;
+    const raw = JSON.parse(fs.readFileSync(oauthPath, "utf-8"));
     if (!raw.accessToken || !raw.refreshToken || !raw.expiresAt) return null;
     return raw as OAuthData;
   } catch {
@@ -41,8 +52,8 @@ function loadFromDisk(): OAuthData | null {
 }
 
 function saveToDisk(data: OAuthData): void {
-  fs.mkdirSync(path.dirname(OAUTH_PATH), { recursive: true });
-  fs.writeFileSync(OAUTH_PATH, JSON.stringify(data, null, 2), { mode: 0o600 });
+  fs.mkdirSync(path.dirname(oauthPath), { recursive: true });
+  fs.writeFileSync(oauthPath, JSON.stringify(data, null, 2), { mode: 0o600 });
 }
 
 async function refreshToken(refreshToken: string): Promise<OAuthData | null> {
@@ -64,16 +75,45 @@ async function refreshToken(refreshToken: string): Promise<OAuthData | null> {
       return null;
     }
 
-    const body = await res.json() as {
-      access_token: string;
-      refresh_token?: string;
-      expires_in: number;
-    };
+    // Validate the response shape before trusting it — mirrors the container's
+    // refreshOAuthToken (container/prepare.ts). Without the expires_in check, a
+    // malformed response mints a NaN expiresAt that slips through the monotonic
+    // guard in updateOAuthData (NaN compares false) into oauth.json.
+    const body = await res.json() as unknown;
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      console.error("[OAuth] Refresh response is not an object");
+      return null;
+    }
+    const {
+      access_token: accessToken,
+      refresh_token: returnedRefreshToken,
+      expires_in: expiresIn,
+    } = body as Record<string, unknown>;
+    if (typeof accessToken !== "string" || accessToken.trim().length === 0) {
+      console.error("[OAuth] Refresh response has no access token");
+      return null;
+    }
+    if (returnedRefreshToken !== undefined &&
+        (typeof returnedRefreshToken !== "string" || returnedRefreshToken.trim().length === 0)) {
+      console.error("[OAuth] Refresh response has a malformed refresh token");
+      return null;
+    }
+    if (accessToken === refreshToken || accessToken === returnedRefreshToken) {
+      console.error("[OAuth] Refresh response echoes the refresh token as access token");
+      return null;
+    }
+    // Cap at one year: values like 1e20 would overflow the Date range and
+    // serialize a garbage expiresAt into oauth.json past the monotonic guard.
+    if (typeof expiresIn !== "number" || !Number.isFinite(expiresIn) ||
+        expiresIn <= 0 || expiresIn > MAX_EXPIRES_IN_SEC) {
+      console.error("[OAuth] Refresh response has an invalid expires_in");
+      return null;
+    }
 
     return {
-      accessToken: body.access_token,
-      refreshToken: body.refresh_token ?? refreshToken, // may rotate
-      expiresAt: Date.now() + body.expires_in * 1000,
+      accessToken,
+      refreshToken: returnedRefreshToken ?? refreshToken, // may rotate
+      expiresAt: Date.now() + expiresIn * 1000,
     };
   } catch (err) {
     console.error(`[OAuth] Refresh error: ${err}`);
@@ -102,6 +142,12 @@ export function getRefreshToken(): string | null {
  * compare-and-swap/generation fix is deferred as disproportionate here.
  */
 export function updateOAuthData(data: OAuthData): void {
+  // NaN/Infinity would slip past the monotonic comparison below (compares
+  // false) and poison oauth.json for every later reader.
+  if (!Number.isFinite(data.expiresAt)) {
+    console.warn("[OAuth] Ignoring token write with a non-finite expiry");
+    return;
+  }
   if (!cached) cached = loadFromDisk();
   if (cached && data.expiresAt <= cached.expiresAt) {
     console.warn("[OAuth] Ignoring stale token write (not newer than current)");

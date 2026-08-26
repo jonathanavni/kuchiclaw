@@ -3,6 +3,7 @@
 
 import TelegramBot from "node-telegram-bot-api";
 import { ALLOWED_SENDER_IDS } from "../config.js";
+import { PermanentDeliveryError } from "./registry.js";
 import type { Channel, IncomingMessage } from "./registry.js";
 
 /** Max message length Telegram allows per message */
@@ -105,23 +106,19 @@ export class TelegramChannel implements Channel {
 
   async sendMessage(chatId: string, text: string): Promise<void> {
     if (!this.bot) throw new Error("Telegram bot not connected");
-
-    // Chunk long messages to stay within Telegram's limit
-    // Use 4000 (not 4096) to leave headroom for HTML tag overhead
-    const chunks = splitMessage(text, TELEGRAM_MAX_LENGTH - 96);
-    for (const chunk of chunks) {
-      const numericId = Number(chatId);
-      try {
-        // Convert standard Markdown to Telegram HTML
-        await this.bot.sendMessage(numericId, markdownToHtml(chunk), {
+    const numericId = Number(chatId);
+    await sendChunked(
+      text,
+      async (html) => {
+        await this.bot!.sendMessage(numericId, html, {
           parse_mode: "HTML",
           disable_web_page_preview: true,
         });
-      } catch {
-        // Fall back to plain text if HTML parsing fails
-        await this.bot.sendMessage(numericId, chunk);
-      }
-    }
+      },
+      async (plain) => {
+        await this.bot!.sendMessage(numericId, plain);
+      },
+    );
   }
 
   /** Send typing indicator to a chat */
@@ -153,15 +150,17 @@ export class TelegramChannel implements Channel {
  * Handles: code blocks, inline code, bold, italic, links, headers.
  * Strips unsupported syntax (horizontal rules, images).
  */
-function markdownToHtml(text: string): string {
+export function markdownToHtml(text: string): string {
   // Step 1: Extract code blocks and inline code to protect them from further processing
   const codeBlocks: string[] = [];
   const placeholder = (i: number) => `\x00CODE${i}\x00`;
 
-  // Fenced code blocks (```...```)
+  // Fenced code blocks (```...```). Strip only the structural newline before the
+  // closing fence — trimming would eat leading indentation, which corrupts a
+  // fence-split continuation chunk whose first code line is indented.
   let result = text.replace(/```(?:\w*\n)?([\s\S]*?)```/g, (_match, code: string) => {
     const i = codeBlocks.length;
-    codeBlocks.push(`<pre><code>${escapeHtml(code.trim())}</code></pre>`);
+    codeBlocks.push(`<pre><code>${escapeHtml(code.replace(/\n$/, ""))}</code></pre>`);
     return placeholder(i);
   });
 
@@ -200,9 +199,10 @@ function markdownToHtml(text: string): string {
   // Horizontal rules (---, ***) → just remove
   result = result.replace(/^[-*_]{3,}\s*$/gm, "");
 
-  // Step 4: Restore code blocks
+  // Step 4: Restore code blocks. Function replacer, not a string: agent-authored
+  // code can contain `$&`/`$'`-style sequences that String.replace would expand.
   for (let i = 0; i < codeBlocks.length; i++) {
-    result = result.replace(placeholder(i), codeBlocks[i]);
+    result = result.replace(placeholder(i), () => codeBlocks[i]);
   }
 
   return result.trim();
@@ -215,26 +215,202 @@ function escapeHtml(text: string): string {
     .replace(/>/g, "&gt;");
 }
 
-/** Split text into chunks that fit within maxLen, breaking at newlines when possible */
-function splitMessage(text: string, maxLen: number): string[] {
+/** A fence line opens or closes a ``` block; must sit at line start (≤3 spaces indent). */
+const FENCE_LINE = /^\s{0,3}```/;
+
+/** Cap for a re-opened fence intro so a pathological language tag can't eat a chunk. */
+const MAX_FENCE_INTRO = 32;
+
+/**
+ * Split text into chunks of at most maxLen chars, breaking at line boundaries
+ * when possible. Fence-aware: a boundary inside a ``` block closes the fence at
+ * the chunk end and re-opens it (with its language tag) at the next chunk start,
+ * so each chunk renders as valid markdown on its own — the pre-P7 splitter cut
+ * mid-fence and left literal backticks in both halves.
+ */
+export function splitMessage(text: string, maxLen: number): string[] {
+  if (maxLen < 64) throw new Error(`splitMessage: maxLen too small (${maxLen})`);
   if (text.length <= maxLen) return [text];
 
+  const budget = maxLen - 4; // reserve room for a closing "\n```"
+  const pieceMax = budget - MAX_FENCE_INTRO - 1; // hard-cut pieces fit even after a re-opened fence
   const chunks: string[] = [];
-  let remaining = text;
+  let fenceIntro: string | null = null; // inside a fence ⇒ its (capped) opening line
+  let current = "";
 
-  while (remaining.length > 0) {
-    if (remaining.length <= maxLen) {
-      chunks.push(remaining);
-      break;
+  const flushAndReopen = () => {
+    chunks.push(fenceIntro !== null ? `${current}\n\`\`\`` : current);
+    current = fenceIntro ?? "";
+  };
+
+  // `continuation` marks a hard-cut piece that continues the previous piece's
+  // source line — it must join without a newline separator.
+  const append = (piece: string, continuation: boolean) => {
+    const sep = current.length > 0 && !continuation ? "\n" : "";
+    const next = current + sep + piece;
+    if (next.length > budget && current.length > 0) {
+      flushAndReopen();
+      append(piece, false); // depth ≤ 2: after reopen, intro + separator + piece ≤ budget
+      return;
     }
+    current = next;
+  };
 
-    // Try to break at last newline within limit
-    let breakIdx = remaining.lastIndexOf("\n", maxLen);
-    if (breakIdx <= 0) breakIdx = maxLen; // No good break point — hard cut
+  for (const rawLine of text.split("\n")) {
+    hardCutPieces(rawLine, pieceMax).forEach((piece, idx) => append(piece, idx > 0));
+    // Toggle on the whole original line, so hard-cut continuations of one long
+    // line can never spuriously open or close a fence.
+    if (FENCE_LINE.test(rawLine)) {
+      fenceIntro = fenceIntro === null ? rawLine.trim().slice(0, MAX_FENCE_INTRO) : null;
+    }
+  }
+  if (current.length > 0) {
+    chunks.push(fenceIntro !== null ? `${current}\n\`\`\`` : current);
+  }
+  return chunks;
+}
 
-    chunks.push(remaining.slice(0, breakIdx));
-    remaining = remaining.slice(breakIdx).replace(/^\n/, ""); // trim leading newline
+/** Hard-cut one overlong line into pieces, never splitting a surrogate pair. */
+function hardCutPieces(line: string, pieceMax: number): string[] {
+  if (line.length <= pieceMax) return [line];
+  const pieces: string[] = [];
+  let rest = line;
+  while (rest.length > pieceMax) {
+    let cut = pieceMax;
+    const code = rest.charCodeAt(cut - 1);
+    if (code >= 0xd800 && code <= 0xdbff) cut--; // high surrogate at the edge
+    pieces.push(rest.slice(0, cut));
+    rest = rest.slice(cut);
+  }
+  pieces.push(rest);
+  return pieces;
+}
+
+export interface ChunkSendOptions {
+  /** Raw-markdown chunk budget (default: Telegram limit minus tag headroom). */
+  maxLen?: number;
+  /** Rendered-HTML hard limit per message (default: Telegram's 4096). */
+  maxRendered?: number;
+  /** Send attempts per chunk before giving up (default 3). */
+  retries?: number;
+  /** Backoff base for transient failures (default 1000ms). */
+  baseMs?: number;
+  /** Injectable for tests. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/** Classify a Telegram send failure: an entity-parse 400 gets a plain-text
+ *  fallback for that chunk; other 4xx (except 429) are permanent — retrying
+ *  them can only duplicate earlier chunks; network/429/5xx are transient. */
+export function classifyTelegramSendError(
+  err: unknown,
+): { kind: "parse" | "transient" | "permanent"; retryAfterMs?: number } {
+  const body = (err as {
+    response?: { body?: { error_code?: number; description?: string; parameters?: { retry_after?: number } } };
+  })?.response?.body;
+  const code = body?.error_code;
+  if (code === 400 && /can't parse entities/i.test(body?.description ?? "")) {
+    return { kind: "parse" };
+  }
+  if (typeof code === "number" && code >= 400 && code < 500 && code !== 429) {
+    return { kind: "permanent" };
+  }
+  const retryAfter = body?.parameters?.retry_after;
+  return { kind: "transient", retryAfterMs: typeof retryAfter === "number" ? retryAfter * 1000 : undefined };
+}
+
+/**
+ * Render and deliver one logical message as sequential Telegram messages.
+ * All retry and fallback handling is PER CHUNK: a later chunk's failure must
+ * never re-send an earlier, already-accepted chunk — deliver()'s outer retry
+ * re-runs the whole send, so this layer only throws once a single chunk has
+ * exhausted its own retries (documented residual: Telegram has no idempotency
+ * key, so exactly-once is unattainable after that point).
+ */
+export async function sendChunked(
+  text: string,
+  sendHtml: (html: string) => Promise<void>,
+  sendPlain: (plain: string) => Promise<void>,
+  options: ChunkSendOptions = {},
+): Promise<void> {
+  const maxLen = options.maxLen ?? TELEGRAM_MAX_LENGTH - 96;
+  for (const chunk of splitMessage(text, maxLen)) {
+    await sendOneChunk(chunk, sendHtml, sendPlain, options);
+  }
+}
+
+async function sendOneChunk(
+  chunk: string,
+  sendHtml: (html: string) => Promise<void>,
+  sendPlain: (plain: string) => Promise<void>,
+  options: ChunkSendOptions,
+): Promise<void> {
+  const maxRendered = options.maxRendered ?? TELEGRAM_MAX_LENGTH;
+  const html = markdownToHtml(chunk);
+  if (html.length > maxRendered) {
+    // Escape expansion (&→&amp; is 5×) blew past the raw-budget headroom —
+    // re-split this chunk at half the raw size. Strictly decreasing, so it
+    // terminates; if it can't shrink further, plain text (no expansion) fits.
+    const smaller = Math.floor(chunk.length / 2);
+    if (smaller < 64) {
+      await sendWithRetry(() => sendPlain(chunk), options);
+      return;
+    }
+    for (const piece of splitMessage(chunk, smaller)) {
+      await sendOneChunk(piece, sendHtml, sendPlain, options);
+    }
+    return;
   }
 
-  return chunks;
+  let mode: "html" | "plain" = "html";
+  await sendWithRetry(async () => {
+    if (mode === "html") {
+      try {
+        await sendHtml(html);
+      } catch (err) {
+        if (classifyTelegramSendError(err).kind !== "parse") throw err;
+        // Telegram rejected our HTML entities — degrade this chunk to plain
+        // text (loudly; the pre-P7 silent catch masked real rendering bugs).
+        console.warn("[Telegram] HTML parse rejected; sending this chunk as plain text");
+        mode = "plain";
+        await sendPlain(chunk);
+      }
+    } else {
+      await sendPlain(chunk);
+    }
+  }, options);
+}
+
+async function sendWithRetry(send: () => Promise<void>, options: ChunkSendOptions): Promise<void> {
+  const retries = options.retries ?? 3;
+  const baseMs = options.baseMs ?? 1000;
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((done) => setTimeout(done, ms)));
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await send();
+      return;
+    } catch (err) {
+      const { kind, retryAfterMs } = classifyTelegramSendError(err);
+      if (kind === "permanent") {
+        // Typed so deliver()'s outer retry gives up instead of re-sending the
+        // whole message (which would duplicate every accepted earlier chunk).
+        throw new PermanentDeliveryError(
+          `Telegram rejected the send permanently: ${formatSendError(err)}`,
+          { cause: err },
+        );
+      }
+      if (attempt >= retries) throw err;
+      // Honor retry_after verbatim — retrying earlier both extends the flood
+      // limit and, on exhaustion, escalates to deliver()'s whole-message retry
+      // (chunk-0 replay). Holding this group's queue slot for the wait is the
+      // correct backpressure; delivery is already a separate failure domain.
+      await sleep(retryAfterMs ?? baseMs * Math.pow(2, attempt - 1));
+    }
+  }
+}
+
+function formatSendError(err: unknown): string {
+  const body = (err as { response?: { body?: { error_code?: number; description?: string } } })?.response?.body;
+  if (body) return `${body.error_code} ${body.description ?? ""}`.trim();
+  return err instanceof Error ? err.message : String(err);
 }

@@ -16,6 +16,7 @@ import {
   updateTaskStatus,
   updateTaskNextRun,
   insertTaskRunLog,
+  getTaskRunLogs,
   initializeIpcLayoutEpoch,
   inspectDbAttestation,
   formatHistory,
@@ -34,9 +35,12 @@ beforeEach(() => {
 });
 
 describe("IPC layout database epoch", () => {
-  it("initializes user_version 2 on a fresh database", () => {
+  it("initializes user_version 2 after every numbered migration has run", () => {
     initializeIpcLayoutEpoch();
     expect(getDb().pragma("user_version", { simple: true })).toBe(2);
+    expect(getDb().prepare("SELECT id FROM schema_migrations ORDER BY id").all()).toEqual([
+      { id: 1 }, { id: 2 }, { id: 3 }, { id: 4 },
+    ]);
   });
 
   it("reads the epoch and legacy task count without schema initialization", () => {
@@ -55,7 +59,56 @@ describe("IPC layout database epoch", () => {
       userVersion: 1,
       scheduledTaskCount: 1,
     });
+    const readonlyCheck = new Database(databasePath, { readonly: true, fileMustExist: true });
+    expect(readonlyCheck.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
+    ).get()).toBeUndefined();
+    readonlyCheck.close();
     fs.rmSync(directory, { recursive: true, force: true });
+  });
+});
+
+describe("schema migration registry", () => {
+  it("adopts a legacy database whose four columns predate the registry", () => {
+    const legacy = new Database(":memory:");
+    legacy.exec(`
+      CREATE TABLE messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        group_folder TEXT NOT NULL,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        processing_status TEXT NOT NULL DEFAULT 'done',
+        chat_id TEXT,
+        sender_name TEXT,
+        recovery_count INTEGER NOT NULL DEFAULT 0
+      );
+    `);
+
+    resetDb(legacy);
+
+    expect(legacy.prepare(
+      "SELECT id, name, applied_at FROM schema_migrations ORDER BY id",
+    ).all()).toEqual([
+      { id: 1, name: "messages_processing_status", applied_at: expect.any(String) },
+      { id: 2, name: "messages_chat_id", applied_at: expect.any(String) },
+      { id: 3, name: "messages_sender_name", applied_at: expect.any(String) },
+      { id: 4, name: "messages_recovery_count", applied_at: expect.any(String) },
+    ]);
+    expect(legacy.pragma("user_version", { simple: true })).toBe(0);
+  });
+
+  it("rethrows genuine migration failures and rolls back the whole batch", () => {
+    const failing = new Database(":memory:");
+    const fillerColumns = Array.from({ length: 1997 }, (_, i) => `f${i} TEXT`).join(",");
+    failing.exec(`CREATE TABLE messages (group_folder TEXT, timestamp TEXT, ${fillerColumns})`);
+
+    expect(() => resetDb(failing)).toThrow(/too many columns/i);
+
+    const columns = failing.pragma("table_info(messages)") as Array<{ name: string }>;
+    expect(columns).toHaveLength(1999);
+    expect(columns.some((column) => column.name === "processing_status")).toBe(false);
+    expect(failing.prepare("SELECT * FROM schema_migrations").all()).toEqual([]);
   });
 });
 
@@ -115,9 +168,7 @@ describe("task_run_logs", () => {
     const taskId = insertTask("main", "chat1", "task", "once", "2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z");
     insertTaskRunLog(taskId, 1500, "success", "all good");
 
-    // Verify via raw query (no dedicated getter needed yet)
-    const db = getDb();
-    const logs = db.prepare("SELECT * FROM task_run_logs WHERE task_id = ?").all(taskId) as any[];
+    const logs = getTaskRunLogs(taskId);
     expect(logs).toHaveLength(1);
     expect(logs[0].duration_ms).toBe(1500);
     expect(logs[0].status).toBe("success");
@@ -128,8 +179,7 @@ describe("task_run_logs", () => {
     const taskId = insertTask("main", "chat1", "task", "once", "2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z");
     insertTaskRunLog(taskId, 500, "error", undefined, "container crashed");
 
-    const db = getDb();
-    const logs = db.prepare("SELECT * FROM task_run_logs WHERE task_id = ?").all(taskId) as any[];
+    const logs = getTaskRunLogs(taskId);
     expect(logs).toHaveLength(1);
     expect(logs[0].status).toBe("error");
     expect(logs[0].error).toBe("container crashed");

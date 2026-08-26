@@ -7,6 +7,7 @@
     "build": "tsc",
     "cli": "tsx src/cli.ts",
     "start": "tsx src/index.ts",
+    "pretest": "tsc --noEmit",
     "test": "vitest run"
   },
   "keywords": [],

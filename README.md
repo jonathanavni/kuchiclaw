@@ -93,9 +93,11 @@ FASTMAIL_GROUPS=main,tg-123         # Explicitly entitled groups (unset/empty = 
 {
   "accessToken": "...",
   "refreshToken": "...",
-  "expiresAt": "2026-01-01T00:00:00Z"
+  "expiresAt": 1767225600000
 }
 ```
+
+`expiresAt` is milliseconds since the epoch (as stored by the macOS keychain).
 
 On macOS, `deploy/export-oauth.sh` extracts tokens from the keychain automatically. Tokens are refreshed at the start of each container run and persisted back to `oauth.json` — no manual rotation needed.
 
@@ -146,7 +148,7 @@ kuchiclaw/                (this repo — public, code + config)
   SOUL.md                 Agent personality (edit this to change who the agent is)
   TOOLS.md                Tool documentation (edit this when adding skills)
   HEARTBEAT.md            Self-maintenance checklist
-  src/                    ~2,000 lines across 15 files
+  src/                    ~4,000 lines across ~26 files
   container/              Runs inside Docker (Claude Agent SDK)
   skills/                 CLI scripts mounted into containers
   groups/example/         Example living files for reference
@@ -173,6 +175,8 @@ scp data/oauth.json root@your-server:/opt/kuchiclaw/data/oauth.json
 # Start
 systemctl start kuchiclaw
 ```
+
+Fresh installs self-initialize their IPC layout on first start. Upgrading an instance that predates the M12 hardening requires the one-time `deploy/cutover-m12-p1.sh` — without it the startup attestation gate refuses to run against a legacy data tree.
 
 Daily backups of living files and the SQLite database are pushed to a private GitHub repo via a systemd timer and a scoped GitHub App (short-lived tokens, `contents: write` on one repo). See `skills/backup.sh` for the implementation.
 

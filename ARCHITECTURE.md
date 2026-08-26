@@ -322,28 +322,42 @@ kuchiclaw/
 ├── mcp-servers.json                # MCP server configs for skills tier 2
 ├── Dockerfile                      # Agent container image
 ├── docker-compose.yml
-├── src/
-│   ├── index.ts                    # Main orchestrator entrypoint
+├── src/                            # (tests colocated as *.test.ts, omitted here)
+│   ├── index.ts                    # Main orchestrator entrypoint + startup gate/sweeps
 │   ├── cli.ts                      # CLI entrypoint (testing)
-│   ├── auth.ts                     # Auth helpers (OAuth refresh → API key → keychain)
+│   ├── auth.ts                     # Auth resolution + skill-secret entitlement
 │   ├── oauth-refresh.ts            # OAuth token auto-refresh (reads/writes data/oauth.json)
-│   ├── container-runner.ts         # Docker container lifecycle
-│   ├── db.ts                       # SQLite schema + queries
+│   ├── container-runner.ts         # Docker container lifecycle + timeout state machine
+│   ├── result-file.ts              # HMAC-signed result file reader (P5.1 transport)
+│   ├── container-errors.ts         # Typed container lifecycle errors
+│   ├── docker.ts                   # Minimal docker CLI seam (spawn/exec)
+│   ├── docker-reap.ts              # Docker preflight + fail-closed container reap
+│   ├── bounded-read.ts             # Shared fd-hardened bounded file reader
+│   ├── instance-lock.ts            # Single-instance TCP lock (kernel-owned)
+│   ├── circuit-breaker.ts          # Startup crash-loop breaker (file-based)
+│   ├── db.ts                       # SQLite schema + queries + migrations
 │   ├── group-folder.ts             # Per-group directory management
 │   ├── group-mapping.ts            # Chat ID → group folder mapping
-│   ├── group-queue.ts              # Per-group FIFO queue with concurrency
-│   ├── ipc.ts                      # Filesystem IPC polling + authorization
+│   ├── group-queue.ts              # Per-group FIFO queue with concurrency + retry
+│   ├── ipc.ts                      # IPC request execution + handlers
+│   ├── ipc-poll.ts                 # IPC polling (bounded, TOCTOU-safe reads)
+│   ├── ipc-auth.ts                 # Canonical identity validators + destination auth
+│   ├── mcp-config.ts               # mcp-servers.json loader
 │   ├── task-scheduler.ts           # Cron/interval/once scheduler
 │   ├── config.ts                   # Configuration constants
 │   ├── types.ts                    # Shared type definitions
 │   └── channels/
-│       ├── telegram.ts             # Telegram adapter (long polling, @mention, allowlist)
+│       ├── telegram.ts             # Telegram adapter (long polling, @mention, allowlist, HTML rendering)
 │       └── registry.ts             # Channel interface definition
 ├── container/
-│   ├── entrypoint.ts               # Runs inside Docker (reads stdin, builds prompt, calls SDK)
-│   └── package.json                # Container-specific deps (claude-agent-sdk only)
+│   ├── entrypoint.ts               # Runs inside Docker (reads stdin, builds prompt, calls SDK, signs result)
+│   ├── prepare.ts                  # SDK-free entrypoint helpers (secrets allowlist, refresh, signing)
+│   ├── package.json                # Container-specific deps (claude-agent-sdk + tsx)
+│   └── package-lock.json           # Lockfile — agent runtime can't float
 ├── skills/                         # Simple skills — CLI scripts/API wrappers (ro mount)
 │   ├── fastmail.mjs                # Email via JMAP (send, inbox, read, reply)
+│   ├── calendar.mjs                # Calendar skill
+│   ├── echo.sh                     # Minimal example skill
 │   └── backup.sh                   # Living file + SQLite backup to private git repo
 ├── groups/                         # Per-group living files (gitignored, created at runtime)
 │   ├── example/                    # Example files for reference (tracked)
@@ -355,14 +369,24 @@ kuchiclaw/
 │       └── logs/
 ├── deploy/
 │   ├── setup.sh                    # VPS provisioning script
+│   ├── update.sh                   # The one deploy path (pull + rebuild + restart)
+│   ├── cutover-m12-p1.sh           # One-time legacy → IPC-layout-v2 cutover
+│   ├── alert.sh                    # Telegram alert (zero dependency on the process)
+│   ├── kuchiclaw-alert@.service    # OnFailure oneshot unit
 │   ├── export-oauth.sh             # Export OAuth tokens from macOS keychain
 │   ├── kuchiclaw-backup.service    # systemd unit for daily backup
 │   └── kuchiclaw-backup.timer      # systemd timer (daily 03:00 UTC)
 ├── kuchiclaw.service               # systemd unit file
-└── data/
+├── docs/
+│   └── handoff-pattern.md          # Reusable two-model workflow methodology
+├── templates/                      # Handoff templates for the workflow
+└── data/                           # (gitignored)
     ├── kuchiclaw.db                # SQLite database
     ├── oauth.json                  # OAuth tokens (chmod 600, gitignored)
-    └── ipc/                        # IPC request directory
+    ├── circuit-breaker.json        # Crash-loop breaker state
+    ├── ipc-layout-v2               # Cutover attestation marker
+    ├── ipc/<group>/                # Per-group IPC request namespaces
+    └── ipc-errors/                 # Quarantined failed/malformed IPC requests
 ```
 
 ---
