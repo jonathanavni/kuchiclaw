@@ -155,10 +155,12 @@ export function markdownToHtml(text: string): string {
   const codeBlocks: string[] = [];
   const placeholder = (i: number) => `\x00CODE${i}\x00`;
 
-  // Fenced code blocks (```...```)
+  // Fenced code blocks (```...```). Strip only the structural newline before the
+  // closing fence — trimming would eat leading indentation, which corrupts a
+  // fence-split continuation chunk whose first code line is indented.
   let result = text.replace(/```(?:\w*\n)?([\s\S]*?)```/g, (_match, code: string) => {
     const i = codeBlocks.length;
-    codeBlocks.push(`<pre><code>${escapeHtml(code.trim())}</code></pre>`);
+    codeBlocks.push(`<pre><code>${escapeHtml(code.replace(/\n$/, ""))}</code></pre>`);
     return placeholder(i);
   });
 
@@ -398,7 +400,9 @@ async function sendWithRetry(send: () => Promise<void>, options: ChunkSendOption
         );
       }
       if (attempt >= retries) throw err;
-      await sleep(retryAfterMs ?? baseMs * Math.pow(2, attempt - 1));
+      // Clamp retry_after: a flood-limit response can carry hundreds of seconds,
+      // which would pin this group's queue slot for the whole wait.
+      await sleep(Math.min(retryAfterMs ?? baseMs * Math.pow(2, attempt - 1), 60_000));
     }
   }
 }

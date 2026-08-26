@@ -92,10 +92,33 @@ describe("splitMessage", () => {
   });
 
   it("does not toggle fence state on hard-cut continuations of one long line", () => {
-    const text = "a".repeat(150) + "```" + "b".repeat(150);
+    // Engineered so a continuation PIECE begins with ``` (piece boundary right
+    // before the backticks) — a buggy per-piece toggle would emit fence closers.
+    const budget = 100 - 4 - 32 - 1; // budget - closeReserve - MAX_FENCE_INTRO - 1 = pieceMax
+    const text = "a".repeat(budget) + "```" + "b".repeat(150);
     const chunks = splitMessage(text, 100);
-    // The ``` sits mid-line, so no chunk should get fence closers appended.
+    expect(chunks[1]?.startsWith("```")).toBe(true);
+    // The ``` sits mid-line, so no chunk gets fence closers/reopeners injected.
     expect(chunks.join("")).toBe(text);
+  });
+
+  it("preserves leading indentation across fence-split chunks (post-impl F2)", () => {
+    const code = Array.from({ length: 30 }, (_, i) =>
+      i % 2 === 0 ? `def f${i}():` : `    return ${i}  # indented`).join("\n");
+    const text = `\`\`\`python\n${code}\n\`\`\``;
+    const chunks = splitMessage(text, 250);
+    expect(chunks.length).toBeGreaterThan(1);
+
+    // Render each chunk, extract the code payloads, and reassemble: the code
+    // must round-trip byte-exact — including indented first lines of
+    // continuation chunks, which .trim() used to destroy.
+    const payloads = chunks.map((chunk) => {
+      const html = markdownToHtml(chunk);
+      const m = html.match(/<pre><code>([\s\S]*)<\/code><\/pre>/);
+      expect(m).not.toBeNull();
+      return m![1].replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&amp;", "&");
+    });
+    expect(payloads.join("\n")).toBe(code);
   });
 });
 

@@ -104,12 +104,12 @@ function poll(): void {
         attempt: 1,
         // Callback fields for task tracking
         onComplete: (result) => {
-          const durationMs = Date.now() - startTime;
+          const durationMs = (deps?.now ?? Date.now)() - startTime;
           insertTaskRunLog(task.id, durationMs, "success", result);
           clearInFlight(task.id);
         },
         onError: (error) => {
-          const durationMs = Date.now() - startTime;
+          const durationMs = (deps?.now ?? Date.now)() - startTime;
           insertTaskRunLog(task.id, durationMs, "error", undefined, error);
           clearInFlight(task.id);
         },

@@ -265,7 +265,10 @@ async function refreshOAuthToken(refreshToken: string): Promise<OAuthTokens | nu
     if (accessToken === refreshToken || accessToken === returnedRefreshToken) return null;
     // A non-numeric expires_in would mint a NaN expiresAt that slips through the
     // host's monotonic guard (NaN compares false) into oauth.json.
-    if (typeof expiresIn !== "number" || !Number.isFinite(expiresIn) || expiresIn <= 0) return null;
+    // Cap at one year — parity with src/oauth-refresh.ts: an overflowing
+    // expires_in must not mint an out-of-range expiresAt on either side.
+    if (typeof expiresIn !== "number" || !Number.isFinite(expiresIn) ||
+        expiresIn <= 0 || expiresIn > 365 * 24 * 3600) return null;
     return {
       accessToken,
       refreshToken: returnedRefreshToken ?? refreshToken,

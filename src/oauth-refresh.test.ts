@@ -120,6 +120,8 @@ describe("refresh response validation (parity with container/prepare.ts)", () =>
     ["non-numeric expires_in (NaN expiresAt)", { access_token: "a", expires_in: "3600" }],
     ["non-finite expires_in", { access_token: "a", expires_in: Infinity }],
     ["non-positive expires_in", { access_token: "a", expires_in: 0 }],
+    ["overflowing expires_in (1e20 — would exceed the Date range)", { access_token: "a", expires_in: 1e20 }],
+    ["expires_in past the one-year ceiling", { access_token: "a", expires_in: 366 * 24 * 3600 }],
   ];
 
   it.each(cases)("rejects a response with %s", async (_label, body) => {
@@ -145,6 +147,13 @@ describe("refresh response validation (parity with container/prepare.ts)", () =>
 });
 
 describe("updateOAuthData (container-returned tokens)", () => {
+  it("rejects a non-finite expiresAt (NaN/Infinity slip the monotonic compare)", () => {
+    updateOAuthData({ accessToken: "good", refreshToken: "r", expiresAt: NOW + 1000 });
+    updateOAuthData({ accessToken: "nan", refreshToken: "r", expiresAt: Number.NaN });
+    updateOAuthData({ accessToken: "inf", refreshToken: "r", expiresAt: Infinity });
+    expect(JSON.parse(fs.readFileSync(oauthPath, "utf-8")).accessToken).toBe("good");
+  });
+
   it("persists newer tokens with 0o600 and rejects stale or equal-expiry writes", () => {
     updateOAuthData({ accessToken: "a1", refreshToken: "r1", expiresAt: NOW + 1000 });
     expect(fs.statSync(oauthPath).mode & 0o777).toBe(0o600);

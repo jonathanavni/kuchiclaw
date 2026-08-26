@@ -16,9 +16,12 @@ const effects = vi.hoisted(() => ({
   quarantineRoot: vi.fn(),
   registerSender: vi.fn(),
   runContainer: vi.fn(),
+  runStartupRetention: vi.fn(),
   startPolling: vi.fn(),
+  startRetentionSweep: vi.fn(),
   startScheduler: vi.fn(),
   stopPolling: vi.fn(),
+  stopRetentionSweep: vi.fn(),
   stopScheduler: vi.fn(),
 }));
 
@@ -73,6 +76,11 @@ vi.mock("./ipc-poll.js", () => ({
 vi.mock("./task-scheduler.js", () => ({
   startScheduler: effects.startScheduler,
   stopScheduler: effects.stopScheduler,
+}));
+vi.mock("./retention.js", () => ({
+  runStartupRetention: effects.runStartupRetention,
+  startRetentionSweep: effects.startRetentionSweep,
+  stopRetentionSweep: effects.stopRetentionSweep,
 }));
 
 type IndexModule = typeof import("./index.js");
@@ -137,12 +145,30 @@ describe("startup gate ordering", () => {
       initializeEpoch: vi.fn(),
     })).rejects.toThrow(/cutover/);
 
-    expect(effects.acquireLock).not.toHaveBeenCalled();
+    // Post-impl F1: the lock is DELIBERATELY acquired before the gate — the
+    // gate mutates data/ (fresh-init sentinel/DB/marker, aborted-init unlink),
+    // so it may only run under the singleton lock; a refusal releases it.
+    expect(effects.acquireLock).toHaveBeenCalledOnce();
+    expect(effects.releaseLock).toHaveBeenCalledOnce();
     expect(effects.execDocker).not.toHaveBeenCalled();
     expect(effects.getOrphanedMessages).not.toHaveBeenCalled();
     expect(effects.channelConstructed).not.toHaveBeenCalled();
     expect(effects.startPolling).not.toHaveBeenCalled();
     expect(effects.startScheduler).not.toHaveBeenCalled();
+    expect(effects.runStartupRetention).not.toHaveBeenCalled();
+  });
+
+  it("runs startup retention after recovery and before the channel connects (post-impl gap)", async () => {
+    await indexModule.main(validOptions());
+
+    expect(effects.getOrphanedMessages.mock.invocationCallOrder[0]).toBeLessThan(
+      effects.runStartupRetention.mock.invocationCallOrder[0],
+    );
+    expect(effects.runStartupRetention.mock.invocationCallOrder[0]).toBeLessThan(
+      effects.channelConnect.mock.invocationCallOrder[0],
+    );
+    expect(effects.startRetentionSweep).toHaveBeenCalledOnce();
+    await stopStartedMain();
   });
 
   it("finishes preflight and reap before recovery can start a container", async () => {

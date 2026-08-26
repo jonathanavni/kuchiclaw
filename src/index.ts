@@ -15,6 +15,7 @@ import {
   initializeIpcLayoutEpoch,
   insertMessage,
   getOrphanedMessages,
+  DB_PATH,
   getStuckProcessingMessages,
   incrementRecoveryCount,
   inspectDbAttestation,
@@ -79,7 +80,9 @@ export function enforceStartupGate(options: StartupGateOptions = {}): void {
   const initPendingPath = options.initPendingPath ?? (options.markerPath
     ? path.join(path.dirname(markerPath), "init-pending")
     : INIT_PENDING_SENTINEL);
-  const dbPath = options.dbPath ?? path.join(path.dirname(markerPath), "kuchiclaw.db");
+  // Follow an overridden marker dir in tests; otherwise use the canonical path.
+  const dbPath = options.dbPath ??
+    (options.markerPath ? path.join(path.dirname(markerPath), "kuchiclaw.db") : DB_PATH);
   const inspectDb = options.inspectDb ?? inspectDbAttestation;
   const initializeEpoch = options.initializeEpoch ?? initializeIpcLayoutEpoch;
 
@@ -208,10 +211,14 @@ export async function main(startupOptions: StartupGateOptions = {}): Promise<voi
     await enforceStartupBackoff(startupOptions.cbPath ? { cbPath: startupOptions.cbPath } : {});
   }
 
-  enforceStartupGate(startupOptions);
+  // Lock BEFORE the gate: the gate mutates data/ (fresh-init sentinel/DB/marker,
+  // aborted-init unlink), so a concurrent start racing it could delete the other
+  // process's live database. The lock is side-effect-free and auto-releases on
+  // any death, so taking it first is strictly safer.
   const instanceLock = await acquireInstanceLock();
 
   try {
+    enforceStartupGate(startupOptions);
     await preflightDocker();
     await reapOrchestratorContainers();
     quarantineLooseRootRequests();
