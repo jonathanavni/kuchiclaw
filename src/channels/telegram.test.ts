@@ -1,13 +1,20 @@
+import { NetworkError, ParseError, TelegramApiError, TimeoutError } from "node-telegram-bot-api";
 import { describe, expect, it, vi } from "vitest";
 import { PermanentDeliveryError } from "./registry.js";
 import {
   classifyTelegramSendError,
   gateGroupMessage,
+  startupCallWithBudget,
   isAllowedSender,
   markdownToHtml,
   sendChunked,
   splitMessage,
 } from "./telegram.js";
+
+/** Real v2 error instances — classification must hold against true instanceof,
+ *  not a hand-rolled duck (the v0.67 suite's silent-degradation trap). */
+const tgError = (code: number, description: string, retryAfter?: number) =>
+  new TelegramApiError(code, description, retryAfter !== undefined ? { retry_after: retryAfter } : undefined);
 
 // The allowlist is passed explicitly so tests don't depend on process.env.
 describe("isAllowedSender (P6.6 fail-closed)", () => {
@@ -177,11 +184,7 @@ describe("markdownToHtml", () => {
   });
 });
 
-describe("classifyTelegramSendError", () => {
-  const tgError = (code: number, description: string, retryAfter?: number) => ({
-    response: { body: { error_code: code, description, parameters: retryAfter ? { retry_after: retryAfter } : undefined } },
-  });
-
+describe("classifyTelegramSendError (v2 typed errors)", () => {
   it("classifies an entity-parse 400 as parse", () => {
     expect(classifyTelegramSendError(tgError(400, "Bad Request: can't parse entities: ..."))).toEqual({ kind: "parse" });
   });
@@ -190,15 +193,78 @@ describe("classifyTelegramSendError", () => {
     expect(classifyTelegramSendError(tgError(429, "Too Many Requests", 7))).toEqual({ kind: "transient", retryAfterMs: 7000 });
   });
 
-  it("classifies bare network errors and 5xx as transient", () => {
-    expect(classifyTelegramSendError(new Error("ECONNRESET"))).toEqual({ kind: "transient", retryAfterMs: undefined });
+  it("classifies a 429 WITHOUT retry_after as transient with undefined retryAfterMs", () => {
+    expect(classifyTelegramSendError(tgError(429, "Too Many Requests"))).toEqual({ kind: "transient", retryAfterMs: undefined });
+  });
+
+  it("classifies 5xx as transient", () => {
     expect(classifyTelegramSendError(tgError(502, "Bad Gateway"))).toEqual({ kind: "transient", retryAfterMs: undefined });
+  });
+
+  it("classifies typed transport errors as transient", () => {
+    expect(classifyTelegramSendError(new NetworkError("fetch failed"))).toEqual({ kind: "transient" });
+    expect(classifyTelegramSendError(new TimeoutError())).toEqual({ kind: "transient" });
+    expect(classifyTelegramSendError(new ParseError("bad envelope"))).toEqual({ kind: "transient" });
   });
 
   it("classifies non-parse 4xx as permanent (round-3 F2)", () => {
     expect(classifyTelegramSendError(tgError(403, "Forbidden: bot was blocked by the user"))).toEqual({ kind: "permanent" });
     expect(classifyTelegramSendError(tgError(400, "Bad Request: chat not found"))).toEqual({ kind: "permanent" });
     expect(classifyTelegramSendError(tgError(401, "Unauthorized"))).toEqual({ kind: "permanent" });
+  });
+
+  it("classifies caller-abort DOMExceptions as transient WITHOUT the unknown-shape noise (verify r2)", () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    expect(classifyTelegramSendError(new DOMException("t", "TimeoutError"))).toEqual({ kind: "transient" });
+    expect(classifyTelegramSendError(new DOMException("a", "AbortError"))).toEqual({ kind: "transient" });
+    expect(error).not.toHaveBeenCalled();
+    error.mockRestore();
+  });
+
+  it("treats an unknown error shape as transient but logs loudly (plan v2 F3)", () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    expect(classifyTelegramSendError(new Error("ECONNRESET"))).toEqual({ kind: "transient" });
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("Unclassified"), expect.anything());
+    error.mockRestore();
+  });
+});
+
+describe("startupCallWithBudget (round-3 R3-1: budgeted startup calls)", () => {
+  const me = { id: 42, is_bot: true as const, first_name: "kuchi", username: "kuchi_bot" };
+
+  it("retries a transient failure then succeeds", async () => {
+    const sleeps: number[] = [];
+    const getMe = vi.fn()
+      .mockRejectedValueOnce(new NetworkError("fetch failed"))
+      .mockResolvedValueOnce(me);
+    await expect(
+      startupCallWithBudget(getMe, { sleep: async (ms) => { sleeps.push(ms); } }),
+    ).resolves.toEqual(me);
+    expect(sleeps).toEqual([1000]);
+  });
+
+  it("fails fast on a permanent 4xx (bad token)", async () => {
+    const getMe = vi.fn().mockRejectedValue(tgError(401, "Unauthorized"));
+    await expect(startupCallWithBudget(getMe, { sleep: async () => {} })).rejects.toMatchObject({ errorCode: 401 });
+    expect(getMe).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails startup when retry_after exceeds the budget — never waits early, never clamps", async () => {
+    const sleeps: number[] = [];
+    const getMe = vi.fn().mockRejectedValue(tgError(429, "flood", 300));
+    await expect(
+      startupCallWithBudget(getMe, { budgetMs: 30_000, sleep: async (ms) => { sleeps.push(ms); } }),
+    ).rejects.toMatchObject({ errorCode: 429 });
+    expect(getMe).toHaveBeenCalledTimes(1); // 300s does not fit a 30s budget
+    expect(sleeps).toEqual([]);
+  });
+
+  it("gives up after maxAttempts on persistent transient failures", async () => {
+    const getMe = vi.fn().mockRejectedValue(new TimeoutError());
+    await expect(
+      startupCallWithBudget(getMe, { maxAttempts: 3, sleep: async () => {} }),
+    ).rejects.toBeInstanceOf(TimeoutError);
+    expect(getMe).toHaveBeenCalledTimes(3);
   });
 });
 
@@ -219,7 +285,7 @@ describe("sendChunked (round-1 F2: per-chunk delivery)", () => {
     const c = collector();
     let chunk2Failures = 1;
     const flakyHtml = vi.fn(async (h: string) => {
-      if (c.sent.length >= 1 && chunk2Failures-- > 0) throw new Error("socket hang up");
+      if (c.sent.length >= 1 && chunk2Failures-- > 0) throw new NetworkError("socket hang up");
       c.sent.push({ mode: "html", text: h });
     });
 
@@ -238,7 +304,7 @@ describe("sendChunked (round-1 F2: per-chunk delivery)", () => {
     const parseFailOnSecond = vi.fn(async (h: string) => {
       call++;
       if (call === 2) {
-        throw { response: { body: { error_code: 400, description: "can't parse entities" } } };
+        throw tgError(400, "Bad Request: can't parse entities");
       }
       c.sent.push({ mode: "html", text: h });
     });
@@ -258,13 +324,13 @@ describe("sendChunked (round-1 F2: per-chunk delivery)", () => {
     let htmlCall = 0;
     const htmlParseFailOnSecond = vi.fn(async (h: string) => {
       htmlCall++;
-      if (htmlCall === 2) throw { response: { body: { error_code: 400, description: "can't parse entities" } } };
+      if (htmlCall === 2) throw tgError(400, "Bad Request: can't parse entities");
       c.sent.push({ mode: "html", text: h });
     });
     let plainCall = 0;
     const plainFlaky = vi.fn(async (p: string) => {
       plainCall++;
-      if (plainCall === 1) throw { response: { body: { error_code: 429, description: "flood", parameters: { retry_after: 3 } } } };
+      if (plainCall === 1) throw tgError(429, "flood", 3);
       c.sent.push({ mode: "plain", text: p });
     });
 
@@ -282,14 +348,14 @@ describe("sendChunked (round-1 F2: per-chunk delivery)", () => {
   it("throws only after per-chunk retries exhaust, honoring retry_after backoff", async () => {
     const sleeps: number[] = [];
     const alwaysFail = vi.fn(async () => {
-      throw { response: { body: { error_code: 429, description: "flood", parameters: { retry_after: 2 } } } };
+      throw tgError(429, "flood", 2);
     });
 
     await expect(
       sendChunked("short message", alwaysFail, alwaysFail, {
         maxLen: 200, retries: 3, sleep: async (ms) => { sleeps.push(ms); },
       }),
-    ).rejects.toMatchObject({ response: { body: { error_code: 429 } } });
+    ).rejects.toMatchObject({ errorCode: 429 });
     expect(alwaysFail).toHaveBeenCalledTimes(3);
     expect(sleeps).toEqual([2000, 2000]);
   });
@@ -299,7 +365,7 @@ describe("sendChunked (round-1 F2: per-chunk delivery)", () => {
     let failures = 1;
     const floodOnce = vi.fn(async () => {
       if (failures-- > 0) {
-        throw { response: { body: { error_code: 429, description: "flood", parameters: { retry_after: 300 } } } };
+        throw tgError(429, "flood", 300);
       }
     });
 
@@ -315,7 +381,7 @@ describe("sendChunked (round-1 F2: per-chunk delivery)", () => {
     let call = 0;
     const blockedOnSecond = vi.fn(async (h: string) => {
       call++;
-      if (call === 2) throw { response: { body: { error_code: 403, description: "Forbidden: bot was blocked by the user" } } };
+      if (call === 2) throw tgError(403, "Forbidden: bot was blocked by the user");
       c.sent.push({ mode: "html", text: h });
     });
 
@@ -340,5 +406,54 @@ describe("sendChunked (round-1 F2: per-chunk delivery)", () => {
     for (const s of c.sent) expect(s.text.length).toBeLessThanOrEqual(4096);
     const roundTripped = c.sent.map((s) => s.text.replaceAll("&amp;", "&")).join("");
     expect(roundTripped).toBe(text);
+  });
+});
+
+describe("sendChunked partial-delivery guard (plan v3 R2-1/R2-5, v3.1 R3-3)", () => {
+  const twoChunkText = Array.from({ length: 40 }, (_, i) => `line ${i}`).join("\n");
+
+  it("chunk-2 exhaustion after chunk 1 accepted → PermanentDeliveryError, chunk 1 sent once, cause preserved", async () => {
+    const sent: string[] = [];
+    let call = 0;
+    const failFromSecond = vi.fn(async (h: string) => {
+      call++;
+      if (call >= 2) throw new NetworkError("socket hang up");
+      sent.push(h);
+    });
+    const err = await sendChunked(twoChunkText, failFromSecond, failFromSecond, {
+      maxLen: 200, retries: 2, sleep: async () => {},
+    }).then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(PermanentDeliveryError);
+    expect((err as Error).message).toContain("partial delivery: 1 sends accepted");
+    expect((err as Error).message).toContain("socket hang up"); // formatted cause in message
+    expect((err as Error & { cause?: unknown }).cause).toBeInstanceOf(NetworkError);
+    const chunks = splitMessage(twoChunkText, 200);
+    expect(sent).toEqual([markdownToHtml(chunks[0])]); // chunk 1 exactly once, never replayed
+  });
+
+  it("first-chunk exhaustion with nothing accepted rethrows raw (outer whole-message retry stays duplicate-free)", async () => {
+    const alwaysFail = vi.fn(async () => { throw new TimeoutError(); });
+    await expect(
+      sendChunked(twoChunkText, alwaysFail, alwaysFail, { maxLen: 200, retries: 2, sleep: async () => {} }),
+    ).rejects.toBeInstanceOf(TimeoutError);
+  });
+
+  it("recursive re-split: leaf 1 accepted, leaf 2 exhausts → PermanentDeliveryError via leaf accounting (R3-3: no denominator)", async () => {
+    // One top-level chunk whose rendered HTML overflows → recursive re-split
+    // into multiple leaf sends. A top-level-only accepted flag would miss this.
+    const text = "&".repeat(3000);
+    const sent: string[] = [];
+    let leaf = 0;
+    const failOnSecondLeaf = vi.fn(async (h: string) => {
+      leaf++;
+      if (leaf >= 2) throw new NetworkError("mid-expansion failure");
+      sent.push(h);
+    });
+    const err = await sendChunked(text, failOnSecondLeaf, failOnSecondLeaf, {
+      maxLen: 4000, retries: 2, sleep: async () => {},
+    }).then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(PermanentDeliveryError);
+    expect((err as Error).message).toMatch(/partial delivery: \d+ sends accepted/);
+    expect(sent.length).toBe(1); // leaf 1 exactly once
   });
 });

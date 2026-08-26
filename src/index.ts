@@ -282,12 +282,18 @@ export async function main(startupOptions: StartupGateOptions = {}): Promise<voi
     let exitCode = 0;
     const containmentFailures: string[] = [];
 
-    const requestShutdown = (reason: "signal" | "containment", detail?: Error): void => {
+    const requestShutdown = (reason: "signal" | "containment" | "channel-fatal", detail?: Error): void => {
       if (reason === "containment") {
         exitCode = 1;
         const message = detail?.message ?? "container termination could not be confirmed";
         containmentFailures.push(message);
         console.error(`[Orchestrator] Containment failure: ${message}`);
+      }
+      if (reason === "channel-fatal") {
+        exitCode = 1;
+        console.error(
+          `[Orchestrator] Telegram polling died fatally (restarting): ${detail?.message ?? "unknown"}`,
+        );
       }
       if (shuttingDown) return;
       shuttingDown = true;
@@ -333,12 +339,30 @@ export async function main(startupOptions: StartupGateOptions = {}): Promise<voi
       onContainmentFailure: (error) => requestShutdown("containment", error),
     });
 
+    // Wired BEFORE connect(): the polling pump starts inside connect(), and a
+    // fatal 401/409 landing there must restart the orchestrator (breaker-paced),
+    // never strand a healthy-looking process that can no longer hear Telegram.
+    channel.onFatalError((err) =>
+      requestShutdown("channel-fatal", err instanceof Error ? err : new Error(String(err))),
+    );
+
     recoverOrphanedMessages({ secrets, channel, mcpServers });
     // Pre-intake: the queue holds only recovery re-enqueues here, none of which
     // are >1h-old pending rows, so the stranded-pending pass is race-free.
     runStartupRetention();
 
-    await channel.connect();
+    try {
+      await channel.connect();
+    } catch (err) {
+      // A shutdown-initiated disconnect aborts an in-flight connect (rejects
+      // AbortError). The coordinator owns the drain and the exit code then —
+      // rethrowing would race main().catch's immediate exit(1) against it.
+      if (shuttingDown) return;
+      throw err;
+    }
+    // A polling fatal can fire inside connect() (the pump starts there); the
+    // coordinator has then already stopped producers — don't start them after.
+    if (shuttingDown) return;
     startPolling();
     startScheduler({ secrets, channel, mcpServers });
     startStuckSweep({ secrets, channel, mcpServers });

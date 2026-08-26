@@ -9,6 +9,7 @@ const effects = vi.hoisted(() => ({
   channelConstructed: vi.fn(),
   channelConnect: vi.fn(),
   channelDisconnect: vi.fn(),
+  channelOnFatalError: vi.fn(),
   ensureGroupFolder: vi.fn(() => ({})),
   execDocker: vi.fn(),
   getOrphanedMessages: vi.fn(),
@@ -47,6 +48,7 @@ vi.mock("./channels/telegram.js", () => ({
     connect() { return effects.channelConnect(); }
     disconnect() { return effects.channelDisconnect(); }
     onMessage() {}
+    onFatalError(cb: (err: unknown) => void) { effects.channelOnFatalError(cb); }
     sendMessage() { return Promise.resolve(); }
     sendTyping() { return Promise.resolve(); }
   },
@@ -169,6 +171,31 @@ describe("startup gate ordering", () => {
     );
     expect(effects.startRetentionSweep).toHaveBeenCalledOnce();
     await stopStartedMain();
+  });
+
+  it("wires the fatal-polling callback before the channel connects (ntba-v2 R3-2)", async () => {
+    await indexModule.main(validOptions());
+
+    expect(effects.channelOnFatalError).toHaveBeenCalledOnce();
+    expect(effects.channelOnFatalError.mock.invocationCallOrder[0]).toBeLessThan(
+      effects.channelConnect.mock.invocationCallOrder[0],
+    );
+    await stopStartedMain();
+  });
+
+  it("a polling fatal during connect() reaches shutdown and producers never start (ntba-v2 R3-2)", async () => {
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    effects.channelConnect.mockImplementationOnce(async () => {
+      const fatal = effects.channelOnFatalError.mock.calls[0]?.[0] as (err: unknown) => void;
+      fatal(new Error("409 Conflict: terminated by other getUpdates request"));
+    });
+
+    await indexModule.main(validOptions());
+
+    expect(effects.startPolling).not.toHaveBeenCalled();
+    expect(effects.startScheduler).not.toHaveBeenCalled();
+    expect(effects.startRetentionSweep).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(1));
   });
 
   it("finishes preflight and reap before recovery can start a container", async () => {

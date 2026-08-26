@@ -402,7 +402,7 @@ Minimal by design. Host and container dependencies are kept separate.
 | Package | Purpose |
 |---------|---------|
 | `better-sqlite3` | SQLite database |
-| `node-telegram-bot-api` | Telegram integration |
+| `node-telegram-bot-api` | Telegram integration (v2: native fetch, zero runtime deps, bundled TS types) |
 | `cron-parser` | Cron expression parsing for scheduler |
 | `dotenv` | `.env` file loading |
 
