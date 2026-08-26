@@ -21,6 +21,7 @@ import {
 import { assertDestinationAllowed } from "./ipc-auth.js";
 import { AuthUnavailableError } from "./auth.js";
 import type { ContainerInput, McpServerConfig } from "./types.js";
+import { PermanentDeliveryError } from "./channels/registry.js";
 import type { Channel } from "./channels/registry.js";
 
 export interface Job {
@@ -300,6 +301,13 @@ async function deliver(channel: Channel, chatId: string, text: string): Promise<
       return;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      if (err instanceof PermanentDeliveryError) {
+        // The channel already exhausted its own per-chunk handling and proved
+        // the failure permanent — an outer retry would only duplicate the
+        // chunks the platform already accepted.
+        console.error(`[Queue] Delivery to ${chatId} failed permanently: ${msg}`);
+        return;
+      }
       if (attempt >= DELIVERY_MAX_RETRIES) {
         console.error(`[Queue] Delivery to ${chatId} failed after ${DELIVERY_MAX_RETRIES} attempts: ${msg}`);
         return; // Give up — result is persisted; do not rethrow (would reject the job promise).

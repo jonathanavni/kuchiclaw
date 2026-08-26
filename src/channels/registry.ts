@@ -15,6 +15,16 @@ export interface IncomingMessage {
   senderId?: string;
 }
 
+/** Thrown by a channel's sendMessage when the failure is permanent (e.g. bot
+ *  blocked, malformed request) — retrying can only duplicate already-delivered
+ *  chunks, so the queue's delivery retry must give up on it immediately. */
+export class PermanentDeliveryError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "PermanentDeliveryError";
+  }
+}
+
 /** A messaging channel (Telegram, WhatsApp, etc.) */
 export interface Channel {
   /** Establish connection to the messaging platform */

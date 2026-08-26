@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { PermanentDeliveryError } from "./registry.js";
 import {
   classifyTelegramSendError,
   isAllowedSender,
@@ -133,8 +134,15 @@ describe("classifyTelegramSendError", () => {
     expect(classifyTelegramSendError(tgError(429, "Too Many Requests", 7))).toEqual({ kind: "transient", retryAfterMs: 7000 });
   });
 
-  it("classifies bare network errors as transient", () => {
+  it("classifies bare network errors and 5xx as transient", () => {
     expect(classifyTelegramSendError(new Error("ECONNRESET"))).toEqual({ kind: "transient", retryAfterMs: undefined });
+    expect(classifyTelegramSendError(tgError(502, "Bad Gateway"))).toEqual({ kind: "transient", retryAfterMs: undefined });
+  });
+
+  it("classifies non-parse 4xx as permanent (round-3 F2)", () => {
+    expect(classifyTelegramSendError(tgError(403, "Forbidden: bot was blocked by the user"))).toEqual({ kind: "permanent" });
+    expect(classifyTelegramSendError(tgError(400, "Bad Request: chat not found"))).toEqual({ kind: "permanent" });
+    expect(classifyTelegramSendError(tgError(401, "Unauthorized"))).toEqual({ kind: "permanent" });
   });
 });
 
@@ -228,6 +236,27 @@ describe("sendChunked (round-1 F2: per-chunk delivery)", () => {
     ).rejects.toMatchObject({ response: { body: { error_code: 429 } } });
     expect(alwaysFail).toHaveBeenCalledTimes(3);
     expect(sleeps).toEqual([2000, 2000]);
+  });
+
+  it("a permanent 403 on chunk 2 throws PermanentDeliveryError with no retry and chunk 1 sent once (round-3 F2)", async () => {
+    const c = collector();
+    const sleeps: number[] = [];
+    let call = 0;
+    const blockedOnSecond = vi.fn(async (h: string) => {
+      call++;
+      if (call === 2) throw { response: { body: { error_code: 403, description: "Forbidden: bot was blocked by the user" } } };
+      c.sent.push({ mode: "html", text: h });
+    });
+
+    await expect(
+      sendChunked(twoChunkText, blockedOnSecond, c.plain, {
+        maxLen: 200, sleep: async (ms) => { sleeps.push(ms); },
+      }),
+    ).rejects.toBeInstanceOf(PermanentDeliveryError);
+    const chunks = splitMessage(twoChunkText, 200);
+    expect(c.sent).toEqual([{ mode: "html", text: markdownToHtml(chunks[0]) }]);
+    expect(sleeps).toEqual([]); // permanent: zero retries, zero backoff
+    expect(c.plain).not.toHaveBeenCalled();
   });
 
   it("re-splits a chunk whose rendered HTML exceeds the limit", async () => {

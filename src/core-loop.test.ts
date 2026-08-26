@@ -111,6 +111,27 @@ describe("message round trip: enqueue → container → persist → deliver", ()
     expect(rows.find((r) => r.role === "assistant")?.content).toBe("the reply");
   });
 
+  it("a permanent delivery failure gives up after ONE send attempt (round-3 F2)", async () => {
+    const { PermanentDeliveryError } = await import("./channels/registry.js");
+    const messageId = insertMessage("tg-123", "user", "q");
+    const { channel, mock } = recordingChannel(async () => {
+      throw new PermanentDeliveryError("bot blocked");
+    });
+    vi.mocked(runContainer).mockResolvedValue({ status: "success", result: "kept" });
+
+    await new Promise<void>((done) => {
+      enqueue({
+        group: "tg-123", chatId: "123", senderName: "tester", text: "q",
+        secrets: {}, channel, attempt: 1, messageId,
+        onComplete: () => done(), onError: () => done(),
+      });
+    });
+
+    // No outer delivery retry: one attempt, then give up with the result kept.
+    expect(mock.sendMessage).toHaveBeenCalledTimes(1);
+    expect(messageRows("tg-123").find((r) => r.role === "assistant")?.content).toBe("kept");
+  });
+
   it("a total delivery failure never re-runs the container and keeps the result persisted", async () => {
     const messageId = insertMessage("tg-123", "user", "q");
     const { channel } = recordingChannel(async () => { throw new Error("network down"); });

@@ -3,6 +3,7 @@
 
 import TelegramBot from "node-telegram-bot-api";
 import { ALLOWED_SENDER_IDS } from "../config.js";
+import { PermanentDeliveryError } from "./registry.js";
 import type { Channel, IncomingMessage } from "./registry.js";
 
 /** Max message length Telegram allows per message */
@@ -297,13 +298,20 @@ export interface ChunkSendOptions {
 }
 
 /** Classify a Telegram send failure: an entity-parse 400 gets a plain-text
- *  fallback for that chunk; everything else is transient and retried per-chunk. */
-export function classifyTelegramSendError(err: unknown): { kind: "parse" | "transient"; retryAfterMs?: number } {
+ *  fallback for that chunk; other 4xx (except 429) are permanent — retrying
+ *  them can only duplicate earlier chunks; network/429/5xx are transient. */
+export function classifyTelegramSendError(
+  err: unknown,
+): { kind: "parse" | "transient" | "permanent"; retryAfterMs?: number } {
   const body = (err as {
     response?: { body?: { error_code?: number; description?: string; parameters?: { retry_after?: number } } };
   })?.response?.body;
-  if (body?.error_code === 400 && /can't parse entities/i.test(body.description ?? "")) {
+  const code = body?.error_code;
+  if (code === 400 && /can't parse entities/i.test(body?.description ?? "")) {
     return { kind: "parse" };
+  }
+  if (typeof code === "number" && code >= 400 && code < 500 && code !== 429) {
+    return { kind: "permanent" };
   }
   const retryAfter = body?.parameters?.retry_after;
   return { kind: "transient", retryAfterMs: typeof retryAfter === "number" ? retryAfter * 1000 : undefined };
@@ -380,9 +388,23 @@ async function sendWithRetry(send: () => Promise<void>, options: ChunkSendOption
       await send();
       return;
     } catch (err) {
+      const { kind, retryAfterMs } = classifyTelegramSendError(err);
+      if (kind === "permanent") {
+        // Typed so deliver()'s outer retry gives up instead of re-sending the
+        // whole message (which would duplicate every accepted earlier chunk).
+        throw new PermanentDeliveryError(
+          `Telegram rejected the send permanently: ${formatSendError(err)}`,
+          { cause: err },
+        );
+      }
       if (attempt >= retries) throw err;
-      const { retryAfterMs } = classifyTelegramSendError(err);
       await sleep(retryAfterMs ?? baseMs * Math.pow(2, attempt - 1));
     }
   }
+}
+
+function formatSendError(err: unknown): string {
+  const body = (err as { response?: { body?: { error_code?: number; description?: string } } })?.response?.body;
+  if (body) return `${body.error_code} ${body.description ?? ""}`.trim();
+  return err instanceof Error ? err.message : String(err);
 }
