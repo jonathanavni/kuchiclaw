@@ -10,7 +10,7 @@ A minimal AI agent framework with Docker container isolation, built from scratch
 
 I built KuchiClaw to learn the [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk) hands-on, to understand [OpenClaw](https://openclaw.ai/)'s architecture by building a simpler version of it, and to end up with something I'm actually going to use for personal automation. It's inspired by [NanoClaw](https://github.com/qwibitai/nanoclaw) (~3,900 lines), a lightweight alternative to OpenClaw (434K lines). KuchiClaw takes the same core architecture — ephemeral containers, living files, filesystem IPC — and builds the smallest version that works in production.
 
-Today it's a production-ready, self-healing agent running 24/7 with durable backups. It's also not a framework you install — it's a reference implementation you clone, read, modify, and make your own. The architecture is intentionally simple enough that you can add new skills, swap out the messaging channel, or change the memory system without fighting abstractions.
+Today it runs 24/7 as my personal assistant: it restarts itself when things break and backs up its own memory every night. You don't install it as a framework — you clone it, read it, and make it your own. The architecture is intentionally simple enough that you can add new skills, swap out the messaging channel, or change the memory system without fighting abstractions.
 
 ## How it works
 
@@ -44,7 +44,7 @@ Each user message triggers a fresh Docker container. The container gets the [Cla
 | CONTEXT.md | Per-group | Read-write | Session working memory (prompt-injected) |
 | TODO.md | Per-group | Read-write | Shared to-do list — read on demand, never prompt-injected |
 
-For the full architecture deep-dive — design decisions, tradeoffs, and implementation phases — see [ARCHITECTURE.md](ARCHITECTURE.md).
+Design decisions, tradeoffs, and how it was built phase by phase: [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Clone it and make it yours
 
@@ -140,7 +140,7 @@ curl -s "https://wttr.in/$1?format=3"
 
 Then add usage docs to TOOLS.md so the agent knows how to call it. That's it — no registration, no protocol, no framework code.
 
-The repo ships working examples: `fastmail.mjs` (send/read email via JMAP), `gcal.mjs` (a shared Google Calendar via a GCP service account), `calendar.mjs` (.ics email invites for external guests), and `backup.sh` (the daily memory backup). Skill secrets are per-group entitled — a token only reaches the groups you explicitly name (e.g. `FASTMAIL_GROUPS`).
+The repo ships working examples: `fastmail.mjs` (send/read email via JMAP), `gcal.mjs` (a shared Google Calendar via a GCP service account), `calendar.mjs` (.ics email invites for external guests), and `backup.sh` (the daily memory backup). Skill secrets are scoped per group — a token only reaches the groups you name in `.env` (e.g. `FASTMAIL_GROUPS`).
 
 ### MCP skills
 
