@@ -20,6 +20,24 @@ export function isAllowedSender(
   return senderId !== undefined && allowlist.includes(senderId);
 }
 
+/** Group-chat trigger gate: returns the text to process (mention stripped), or
+ *  null when the message should be ignored. Triggers on an @mention of the bot
+ *  or a Telegram reply to one of the bot's own messages — a reply is the
+ *  instinctive follow-up and used to be silently dropped. */
+export function gateGroupMessage(
+  text: string,
+  botUsername: string,
+  isReplyToBot: boolean,
+): string | null {
+  if (!botUsername) return text; // username unknown ⇒ no gate (pre-existing behavior)
+  const mentionTag = `@${botUsername}`;
+  if (text.includes(mentionTag)) {
+    const stripped = text.replace(mentionTag, "").trim();
+    return stripped || null; // nothing left after stripping mention
+  }
+  return isReplyToBot ? text : null;
+}
+
 export type MessageHandler = (msg: IncomingMessage) => void;
 
 export class TelegramChannel implements Channel {
@@ -29,6 +47,7 @@ export class TelegramChannel implements Channel {
   private onMessageHandler: MessageHandler | null = null;
   private startTime = Date.now();
   private botUsername = "";
+  private botId = 0;
 
   constructor(token: string) {
     this.token = token;
@@ -43,9 +62,11 @@ export class TelegramChannel implements Channel {
     this.bot = new TelegramBot(this.token, { polling: true });
     this.startTime = Date.now();
 
-    // Learn our own username for @mention detection in group chats
+    // Learn our own identity: username for @mention detection, id for
+    // reply-to-bot detection in group chats
     const me = await this.bot.getMe();
     this.botUsername = me.username ?? "";
+    this.botId = me.id;
 
     // /start stays UNGATED on purpose: it's the bootstrap channel. A fresh
     // operator needs their chat ID (for MAIN_CHAT_ID) and user ID (for
@@ -76,14 +97,14 @@ export class TelegramChannel implements Channel {
 
       if (!isAllowedSender(senderId)) return;
 
-      // Group chats require @mention to activate
+      // Group chats require @mention or a reply to the bot to activate
       let text = msg.text;
       const isGroupChat = chatType === "group" || chatType === "supergroup";
-      if (isGroupChat && this.botUsername) {
-        const mentionTag = `@${this.botUsername}`;
-        if (!text.includes(mentionTag)) return;
-        text = text.replace(mentionTag, "").trim();
-        if (!text) return; // Nothing left after stripping mention
+      if (isGroupChat) {
+        const isReplyToBot = msg.reply_to_message?.from?.id === this.botId;
+        const gated = gateGroupMessage(text, this.botUsername, isReplyToBot);
+        if (gated === null) return;
+        text = gated;
       }
 
       const senderName =

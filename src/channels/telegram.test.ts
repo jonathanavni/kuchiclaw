@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { PermanentDeliveryError } from "./registry.js";
 import {
   classifyTelegramSendError,
+  gateGroupMessage,
   isAllowedSender,
   markdownToHtml,
   sendChunked,
@@ -30,6 +31,38 @@ describe("isAllowedSender (P6.6 fail-closed)", () => {
   it("explicit '*' allows anyone, including senderless messages", () => {
     expect(isAllowedSender("9", ["*"])).toBe(true);
     expect(isAllowedSender(undefined, ["*"])).toBe(true);
+  });
+});
+
+describe("gateGroupMessage (group-chat trigger gate)", () => {
+  it("triggers on @mention and strips it", () => {
+    expect(gateGroupMessage("@kuchi_bot what time is it?", "kuchi_bot", false)).toBe(
+      "what time is it?",
+    );
+  });
+
+  it("drops a mention-only message (nothing left after stripping)", () => {
+    expect(gateGroupMessage("@kuchi_bot", "kuchi_bot", false)).toBeNull();
+  });
+
+  it("triggers on a reply to the bot, text passed through unchanged", () => {
+    expect(gateGroupMessage("yes, tomorrow works", "kuchi_bot", true)).toBe(
+      "yes, tomorrow works",
+    );
+  });
+
+  it("strips the mention even when the message is also a reply to the bot", () => {
+    expect(gateGroupMessage("@kuchi_bot and invite Keren", "kuchi_bot", true)).toBe(
+      "and invite Keren",
+    );
+  });
+
+  it("drops a plain message that neither mentions nor replies to the bot", () => {
+    expect(gateGroupMessage("just chatting", "kuchi_bot", false)).toBeNull();
+  });
+
+  it("does not gate when the bot username is unknown (pre-existing behavior)", () => {
+    expect(gateGroupMessage("just chatting", "", false)).toBe("just chatting");
   });
 });
 

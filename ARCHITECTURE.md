@@ -108,7 +108,7 @@ SQLite via `better-sqlite3`. Synchronous API is fine for a single-process orches
 
 ### Channel Abstraction
 
-Telegram-first, but a minimal 5-method `Channel` interface (`connect`, `sendMessage`, `isConnected`, `ownsJid`, `disconnect`) makes adding other channels straightforward. Group/supergroup chats require @mention to trigger the bot. DMs always trigger. Unknown senders are filtered via an allowlist.
+Telegram-first, but a minimal 5-method `Channel` interface (`connect`, `sendMessage`, `isConnected`, `ownsJid`, `disconnect`) makes adding other channels straightforward. Group/supergroup chats require an @mention or a reply to one of the bot's messages to trigger the bot. DMs always trigger. Unknown senders are filtered via an allowlist.
 
 ### Multi-Group Isolation
 
@@ -209,7 +209,7 @@ Added vitest with 16 tests covering DB CRUD, task scheduling logic, and drift pr
 
 ### Phase 8: Multi-Group Isolation
 
-Each Telegram chat gets its own group folder with isolated MEMORY.md and CONTEXT.md. Group mapping via `chatIdToGroup()` with channel prefix (`tg-{chatId}`). @mention detection: bot calls `getMe()` on connect, group chats require `@botUsername` mention, DMs always trigger.
+Each Telegram chat gets its own group folder with isolated MEMORY.md and CONTEXT.md. Group mapping via `chatIdToGroup()` with channel prefix (`tg-{chatId}`). Trigger detection: bot calls `getMe()` on connect (username + id), group chats require an `@botUsername` mention or a reply to one of the bot's own messages (matched by bot id), DMs always trigger.
 
 IPC authorization enforced per-group: non-main groups scoped to their own chat and tasks. Main group unrestricted.
 
@@ -347,7 +347,7 @@ kuchiclaw/
 │   ├── config.ts                   # Configuration constants
 │   ├── types.ts                    # Shared type definitions
 │   └── channels/
-│       ├── telegram.ts             # Telegram adapter (long polling, @mention, allowlist, HTML rendering)
+│       ├── telegram.ts             # Telegram adapter (long polling, @mention/reply trigger, allowlist, HTML rendering)
 │       └── registry.ts             # Channel interface definition
 ├── container/
 │   ├── entrypoint.ts               # Runs inside Docker (reads stdin, builds prompt, calls SDK, signs result)
