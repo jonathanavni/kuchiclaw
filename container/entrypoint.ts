@@ -16,18 +16,21 @@ import {
   RESULT_TMP_FILENAME,
   applySecretsToEnv,
   assembleSystemPrompt,
+  classifyError,
   parseInput,
   refreshAuth,
   signEnvelope,
   type AgentEnv,
+  type ContainerErrorKind,
   type ContainerInput,
   type OAuthTokens,
 } from "./prepare.js";
 
-interface ContainerOutput {
+export interface ContainerOutput {
   status: "success" | "error";
   result?: string;
   error?: string;
+  errorKind?: "auth" | "rate_limit" | "max_turns" | "container_crash" | "other";
   newTokens?: OAuthTokens;
   warnings?: string[];
 }
@@ -61,6 +64,7 @@ export async function runEntrypoint(
   let sdkStderr = "";
   let warnings: string[] = [];
   let newTokens: OAuthTokens | undefined;
+  const assistantErrors: string[] = [];
   // The signing key is needed at emit() — after untrusted agent code runs — so
   // it cannot be consumed-then-dropped like refreshToken. It lives only in this
   // closure local: never in env (/proc/pid/environ is same-uid readable), and
@@ -114,8 +118,13 @@ export async function runEntrypoint(
         type: string;
         subtype?: string;
         result?: string;
+        errors?: string[];
+        error?: string;
         message?: { content?: unknown };
       };
+      if (m.type === "assistant" && typeof m.error === "string") {
+        assistantErrors.push(m.error);
+      }
       if (m.type === "assistant" && Array.isArray(m.message?.content)) {
         const texts = (m.message.content as Array<{ type: string; text?: string }>)
           .filter((block) => block.type === "text" && typeof block.text === "string")
@@ -136,7 +145,19 @@ export async function runEntrypoint(
       } else {
         const detail = m.subtype ?? "unknown";
         if (sdkStderr) console.error(`[entrypoint] SDK stderr on ${detail}: ${sdkStderr}`);
-        return emit(withMetadata({ status: "error", error: `Agent stopped: ${detail}` }, warnings, newTokens));
+        const error = `Agent stopped: ${detail}`;
+        return emit(withMetadata({
+          status: "error",
+          error,
+          errorKind: classifyError({
+            source: "sdk_result",
+            assistantErrors,
+            resultErrors: m.errors,
+            subtype: m.subtype,
+            message: error,
+            stderr: sdkStderr,
+          }),
+        }, warnings, newTokens));
       }
     }
 
@@ -144,7 +165,16 @@ export async function runEntrypoint(
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (sdkStderr) console.error(`[entrypoint] SDK stderr: ${sdkStderr}`);
-    return emit(withMetadata({ status: "error", error: `Container crashed: ${message}` }, warnings, newTokens));
+    return emit(withMetadata({
+      status: "error",
+      error: `Container crashed: ${message}`,
+      errorKind: classifyError({
+        source: "entrypoint_catch",
+        assistantErrors,
+        message,
+        stderr: sdkStderr,
+      }),
+    }, warnings, newTokens));
   }
 }
 
@@ -186,9 +216,9 @@ async function readStdin(): Promise<string> {
 
 export function getProductionExitCode(output: {
   status: "success" | "error";
-  error?: string;
+  errorKind?: ContainerErrorKind;
 }): 0 | 1 {
-  return output.status === "error" && output.error?.startsWith("Container crashed:") ? 1 : 0;
+  return output.status === "error" && output.errorKind === "container_crash" ? 1 : 0;
 }
 
 async function main(): Promise<void> {

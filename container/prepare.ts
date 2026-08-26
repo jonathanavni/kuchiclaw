@@ -53,6 +53,60 @@ export interface OAuthTokens {
   expiresAt: number;
 }
 
+export type ContainerErrorKind =
+  | "auth"
+  | "rate_limit"
+  | "max_turns"
+  | "container_crash"
+  | "other";
+
+export interface ErrorEvidence {
+  source: "sdk_result" | "entrypoint_catch";
+  assistantErrors?: readonly string[];
+  resultErrors?: readonly string[];
+  subtype?: string;
+  message?: string;
+  stderr?: string;
+}
+
+const AUTH_ERROR_VALUES = new Set([
+  "authentication_failed",
+  "oauth_org_not_allowed",
+  "account_on_hold",
+  "billing_error",
+]);
+
+/** Classify from typed SDK evidence first; text is a bounded compatibility
+ *  fallback for older/untyped SDK failures. */
+export function classifyError(evidence: ErrorEvidence): ContainerErrorKind {
+  if (evidence.source === "entrypoint_catch") return "container_crash";
+
+  for (const value of evidence.assistantErrors ?? []) {
+    if (AUTH_ERROR_VALUES.has(value)) return "auth";
+    if (value === "rate_limit") return "rate_limit";
+  }
+
+  const structuredTextKind = classifyText(evidence.resultErrors ?? [], 16, 2048);
+  if (structuredTextKind) return structuredTextKind;
+
+  if (evidence.subtype === "error_max_turns") return "max_turns";
+
+  return classifyText([evidence.message ?? "", evidence.stderr ?? ""], 2, 8192) ?? "other";
+}
+
+function classifyText(
+  values: readonly string[],
+  maxValues: number,
+  maxChars: number,
+): "auth" | "rate_limit" | undefined {
+  const text = values.slice(0, maxValues).map((value) => value.slice(0, maxChars)).join("\n").toLowerCase();
+  if (/authentication[_ -]failed|oauth|unauthorized|\b401\b|invalid (?:access )?token|token (?:has )?expired|credentials? (?:are )?invalid/.test(text)) {
+    return "auth";
+  }
+  if (/rate[_ -]limit|too many requests|\b429\b/.test(text)) return "rate_limit";
+  return undefined;
+}
+
 export type AgentEnv = Record<string, string | undefined>;
 
 export function parseInput(raw: string): ContainerInput {

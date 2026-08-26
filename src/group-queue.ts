@@ -233,13 +233,6 @@ async function executeJob(job: Job): Promise<void> {
       return;
     }
 
-    if (isAuthError(errMsg)) {
-      if (job.messageId) updateMessageStatus(job.messageId, "failed");
-      await deliver(channel, chatId, `Authentication error: ${errMsg}`);
-      job.onError?.(errMsg);
-      return;
-    }
-
     if (job.attempt < MAX_RETRIES) {
       const delay = BASE_RETRY_MS * Math.pow(2, job.attempt - 1);
       console.log(`[Queue] Retrying in ${delay}ms...`);
@@ -270,11 +263,16 @@ async function executeJob(job: Job): Promise<void> {
       await deliver(channel, chatId, result);
       job.onComplete?.(result);
     } else {
-      // Agent-level error (not a container crash) — don't retry
+      // A verified error envelope may follow side effects, so every kind is terminal.
       if (job.messageId) updateMessageStatus(job.messageId, "failed");
       const errMsg = `Error: ${output.error ?? "unknown error"}`;
-      console.error(`[Queue] Agent error: ${errMsg}`);
-      await deliver(channel, chatId, errMsg);
+      const userMessage = output.errorKind === "auth"
+        ? "I couldn't process that — the agent credentials need attention."
+        : output.errorKind === "rate_limit"
+          ? "I couldn't process that — the agent is rate limited. Please try again later."
+          : errMsg;
+      console.error(`[Queue] Agent ${output.errorKind ?? "unclassified"} error: ${errMsg}`);
+      await deliver(channel, chatId, userMessage);
       job.onError?.(errMsg);
     }
   } catch (err) {
@@ -317,12 +315,6 @@ async function deliver(channel: Channel, chatId: string, text: string): Promise<
       await sleep(delay);
     }
   }
-}
-
-function isAuthError(msg: string): boolean {
-  const patterns = ["oauth", "unauthorized", "401", "auth", "token expired", "invalid token"];
-  const lower = msg.toLowerCase();
-  return patterns.some((p) => lower.includes(p));
 }
 
 function sleep(ms: number): Promise<void> {

@@ -86,6 +86,9 @@ export const IPC_ERRORS_DIR = path.join(DATA_DIR, "ipc-errors");
 /** Filesystem half of the IPC layout attestation; containers never mount this path. */
 export const IPC_LAYOUT_MARKER = path.join(DATA_DIR, "ipc-layout-v2");
 
+/** Provenance marker for an in-progress fresh-install attestation protocol. */
+export const INIT_PENDING_SENTINEL = path.join(DATA_DIR, "init-pending");
+
 /** Maximum accepted IPC request size, excluding the one-byte overflow probe. */
 export const MAX_REQUEST_BYTES = 64 * 1024;
 

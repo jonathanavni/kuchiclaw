@@ -11,11 +11,14 @@ import {
   applySecretsToEnv,
   buildSessionContext,
   capLivingFile,
+  classifyError,
   parseInput,
   refreshAuth,
   signEnvelope,
   type ContainerInput,
 } from "./prepare.js";
+import type { ContainerOutput as EntrypointContainerOutput } from "./entrypoint.js";
+import type { ContainerOutput as HostContainerOutput } from "../src/types.js";
 import * as hostConfig from "../src/config.js";
 
 afterEach(() => {
@@ -198,5 +201,50 @@ describe("result-transport parity with host config (P5.1)", () => {
     const expected = createHmac("sha256", Buffer.from(key, "hex"))
       .update(envelope.payload, "utf8").digest("hex");
     expect(envelope.hmac).toBe(expected);
+  });
+
+  it("keeps the ContainerOutput payload shape identical across the boundary", () => {
+    type Equal<A, B> =
+      (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2)
+        ? (<T>() => T extends B ? 1 : 2) extends (<T>() => T extends A ? 1 : 2)
+          ? true
+          : false
+        : false;
+    const shapesMatch: Equal<HostContainerOutput, EntrypointContainerOutput> = true;
+    expect(shapesMatch).toBe(true);
+  });
+});
+
+describe("classifyError", () => {
+  it("prioritizes a typed authentication failure over conflicting text", () => {
+    expect(classifyError({
+      source: "sdk_result",
+      assistantErrors: ["authentication_failed"],
+      stderr: "429 rate limit",
+    })).toBe("auth");
+  });
+
+  it("classifies a typed SDK rate limit", () => {
+    expect(classifyError({
+      source: "sdk_result",
+      assistantErrors: ["rate_limit"],
+    })).toBe("rate_limit");
+  });
+
+  it("uses the result errors array for error_during_execution", () => {
+    expect(classifyError({
+      source: "sdk_result",
+      subtype: "error_during_execution",
+      resultErrors: ["API Error: authentication_failed"],
+    })).toBe("auth");
+  });
+
+  it("leaves ambiguous fallback text as other", () => {
+    expect(classifyError({
+      source: "sdk_result",
+      subtype: "error_during_execution",
+      message: "Agent stopped unexpectedly",
+      stderr: "request failed",
+    })).toBe("other");
   });
 });

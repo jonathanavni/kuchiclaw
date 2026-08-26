@@ -40,6 +40,7 @@ import {
   ALLOWED_SENDER_IDS,
   IPC_DIR,
   IPC_LAYOUT_MARKER,
+  INIT_PENDING_SENTINEL,
   MAIN_CHAT_ID,
   SHUTDOWN_TIMEOUT_MS,
   SHUTDOWN_REAP_DRAIN_MS,
@@ -58,6 +59,8 @@ export interface StartupGateOptions {
   allowedSenderIds?: string[];
   ipcDir?: string;
   markerPath?: string;
+  initPendingPath?: string;
+  dbPath?: string;
   inspectDb?: () => DbAttestation;
   initializeEpoch?: () => void;
   /** Tests skip the crash-loop backoff (which would otherwise read/write real breaker state). */
@@ -72,6 +75,10 @@ export function enforceStartupGate(options: StartupGateOptions = {}): void {
   const allowedSenderIds = options.allowedSenderIds ?? ALLOWED_SENDER_IDS;
   const ipcDir = options.ipcDir ?? IPC_DIR;
   const markerPath = options.markerPath ?? IPC_LAYOUT_MARKER;
+  const initPendingPath = options.initPendingPath ?? (options.markerPath
+    ? path.join(path.dirname(markerPath), "init-pending")
+    : INIT_PENDING_SENTINEL);
+  const dbPath = options.dbPath ?? path.join(path.dirname(markerPath), "kuchiclaw.db");
   const inspectDb = options.inspectDb ?? inspectDbAttestation;
   const initializeEpoch = options.initializeEpoch ?? initializeIpcLayoutEpoch;
 
@@ -80,23 +87,26 @@ export function enforceStartupGate(options: StartupGateOptions = {}): void {
   }
 
   const markerPresent = hasValidMarker(markerPath);
+  const initPending = hasValidInitPending(initPendingPath);
+  if (!markerPresent && initPending && isAbsent(ipcDir)) {
+    removeAbortedFreshInit(dbPath, initPendingPath);
+  }
   const dbState = inspectDb();
   if (markerPresent) {
     if (!dbState.exists || dbState.userVersion !== IPC_LAYOUT_DB_VERSION) {
       throw new Error(`IPC cutover attestation mismatch; ${CUTOVER_INSTRUCTION}`);
     }
+    if (initPending) unlinkIfExists(initPendingPath);
   } else {
     if (dbState.exists || !isAbsent(ipcDir)) {
       throw new Error(`IPC cutover attestation missing; ${CUTOVER_INSTRUCTION}`);
     }
+    fs.mkdirSync(path.dirname(initPendingPath), { recursive: true });
+    createExclusiveFile(initPendingPath);
     initializeEpoch();
     fs.mkdirSync(path.dirname(markerPath), { recursive: true });
-    const fd = fs.openSync(
-      markerPath,
-      fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
-      0o600,
-    );
-    fs.closeSync(fd);
+    createExclusiveFile(markerPath);
+    unlinkIfExists(initPendingPath);
   }
 
   // Fail closed: an unset allowlist is a config mistake, not a policy choice.
@@ -112,6 +122,47 @@ export function enforceStartupGate(options: StartupGateOptions = {}): void {
     console.warn(
       "[SECURITY] WARNING: ALLOWED_SENDER_IDS=* — any Telegram user who can reach the bot is allowed.",
     );
+  }
+}
+
+function createExclusiveFile(filePath: string): void {
+  const fd = fs.openSync(
+    filePath,
+    fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function hasValidInitPending(sentinelPath: string): boolean {
+  try {
+    const stat = fs.lstatSync(sentinelPath);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new Error("Invalid fresh-init sentinel");
+    }
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+}
+
+function removeAbortedFreshInit(dbPath: string, sentinelPath: string): void {
+  for (const filePath of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+    unlinkIfExists(filePath);
+  }
+  unlinkIfExists(sentinelPath);
+}
+
+function unlinkIfExists(filePath: string): void {
+  try {
+    fs.unlinkSync(filePath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
   }
 }
 

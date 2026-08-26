@@ -129,20 +129,76 @@ function initSchema(database: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_task_run_logs_task
       ON task_run_logs (task_id, run_at DESC);
+
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      applied_at TEXT NOT NULL
+    );
   `);
 
-  // M10 migration: crash recovery columns on messages table.
-  // ALTER TABLE throws if column already exists — catch to stay idempotent.
-  const migrations = [
-    `ALTER TABLE messages ADD COLUMN processing_status TEXT NOT NULL DEFAULT 'done'`,
-    `ALTER TABLE messages ADD COLUMN chat_id TEXT`,
-    `ALTER TABLE messages ADD COLUMN sender_name TEXT`,
-    // M12 P3: cap how many times a message is replayed across restarts/sweeps.
-    `ALTER TABLE messages ADD COLUMN recovery_count INTEGER NOT NULL DEFAULT 0`,
-  ];
-  for (const sql of migrations) {
-    try { database.exec(sql); } catch { /* column already exists */ }
-  }
+  runMigrations(database);
+}
+
+interface SchemaMigration {
+  id: number;
+  name: string;
+  up: (database: Database.Database) => void;
+}
+
+const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
+  {
+    id: 1,
+    name: "messages_processing_status",
+    up: (database) => database.exec(
+      "ALTER TABLE messages ADD COLUMN processing_status TEXT NOT NULL DEFAULT 'done'",
+    ),
+  },
+  {
+    id: 2,
+    name: "messages_chat_id",
+    up: (database) => database.exec("ALTER TABLE messages ADD COLUMN chat_id TEXT"),
+  },
+  {
+    id: 3,
+    name: "messages_sender_name",
+    up: (database) => database.exec("ALTER TABLE messages ADD COLUMN sender_name TEXT"),
+  },
+  {
+    id: 4,
+    name: "messages_recovery_count",
+    up: (database) => database.exec(
+      "ALTER TABLE messages ADD COLUMN recovery_count INTEGER NOT NULL DEFAULT 0",
+    ),
+  },
+];
+
+function runMigrations(database: Database.Database): void {
+  const applied = new Set(
+    (database.prepare("SELECT id FROM schema_migrations").all() as Array<{ id: number }>)
+      .map((row) => row.id),
+  );
+  const record = database.prepare(
+    "INSERT INTO schema_migrations (id, name, applied_at) VALUES (?, ?, datetime('now'))",
+  );
+
+  database.transaction(() => {
+    for (const migration of SCHEMA_MIGRATIONS) {
+      if (applied.has(migration.id)) continue;
+      try {
+        migration.up(database);
+      } catch (err) {
+        // Existing deployments predate the registry but already have these
+        // columns. Only SQLite's duplicate-column failure is baseline adoption.
+        if (!isDuplicateColumnError(err)) throw err;
+      }
+      record.run(migration.id, migration.name);
+    }
+  })();
+}
+
+function isDuplicateColumnError(err: unknown): boolean {
+  return err instanceof Error && /duplicate column name:/i.test(err.message);
 }
 
 /** Store a message. Returns the row ID for status tracking. */
@@ -366,4 +422,11 @@ export function insertTaskRunLog(
     VALUES (?, ?, ?, ?, ?)
   `);
   stmt.run(taskId, durationMs, status, result ?? null, error ?? null);
+}
+
+/** Get all recorded runs for a task in execution order. */
+export function getTaskRunLogs(taskId: number): TaskRunLog[] {
+  return getDb()
+    .prepare("SELECT * FROM task_run_logs WHERE task_id = ? ORDER BY run_at ASC, id ASC")
+    .all(taskId) as TaskRunLog[];
 }

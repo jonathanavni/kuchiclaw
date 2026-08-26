@@ -12,7 +12,7 @@ vi.mock("./config.js", async (importActual) => ({
 }));
 
 import { SCHEDULER_POLL_MS } from "./config.js";
-import { getDb, getTasksByGroup, insertTask, resetDb, updateTaskNextRun } from "./db.js";
+import { getTaskRunLogs, getTasksByGroup, insertTask, resetDb, updateTaskNextRun } from "./db.js";
 import { advanceNextRun, resetSchedulerForTest, startScheduler } from "./task-scheduler.js";
 import type { Channel } from "./channels/registry.js";
 import type { ScheduledTask } from "./types.js";
@@ -199,7 +199,7 @@ describe("poll() ordering and in-flight dedup", () => {
       vi.advanceTimersByTime(SCHEDULER_POLL_MS);
       expect(enqueue).toHaveBeenCalledTimes(2);
 
-      const logs = getDb().prepare("SELECT * FROM task_run_logs WHERE task_id = ?").all(id);
+      const logs = getTaskRunLogs(id);
       expect(logs).toHaveLength(1);
     } finally {
       vi.useRealTimers();
@@ -213,10 +213,8 @@ describe("poll() ordering and in-flight dedup", () => {
 
     job.onComplete("all good");
     job.onError("boom");
-    const logs = getDb()
-      .prepare("SELECT status, result, error FROM task_run_logs WHERE task_id = ? ORDER BY id")
-      .all(id) as Array<{ status: string; result: string | null; error: string | null }>;
-    expect(logs).toEqual([
+    const logs = getTaskRunLogs(id);
+    expect(logs.map(({ status, result, error }) => ({ status, result, error }))).toEqual([
       { status: "success", result: "all good", error: null },
       { status: "error", result: null, error: "boom" },
     ]);

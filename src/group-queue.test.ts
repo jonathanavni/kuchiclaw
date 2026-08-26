@@ -154,13 +154,40 @@ describe("group-queue executeJob", () => {
     expect(updateMessageStatus).toHaveBeenCalledWith(1, "failed");
   });
 
-  it("does not retry an auth-classified container error", async () => {
-    vi.mocked(runContainer).mockRejectedValue(new Error("401 unauthorized"));
+  it("delivers a distinct credentials message for a terminal auth envelope", async () => {
+    const channel = makeChannel();
+    vi.mocked(runContainer).mockResolvedValue({
+      status: "error",
+      error: "Agent stopped: error_during_execution",
+      errorKind: "auth",
+    });
 
-    const done = await runJob({});
+    const done = await runJob({ channel: channel as never });
 
-    expect(done.error).toMatch(/unauthorized/);
-    expect(runContainer).toHaveBeenCalledTimes(1); // auth errors are terminal
+    expect(done.error).toMatch(/error_during_execution/);
+    expect(runContainer).toHaveBeenCalledTimes(1);
+    expect(channel.sendMessage).toHaveBeenCalledWith(
+      "123",
+      expect.stringMatching(/credentials need attention/i),
+    );
+    expect(updateMessageStatus).toHaveBeenCalledWith(1, "failed");
+  });
+
+  it("delivers a distinct try-later message for a terminal rate-limit envelope", async () => {
+    const channel = makeChannel();
+    vi.mocked(runContainer).mockResolvedValue({
+      status: "error",
+      error: "Agent stopped: error_during_execution",
+      errorKind: "rate_limit",
+    });
+
+    await runJob({ channel: channel as never });
+
+    expect(runContainer).toHaveBeenCalledTimes(1);
+    expect(channel.sendMessage).toHaveBeenCalledWith(
+      "123",
+      expect.stringMatching(/rate limited.*try again later/i),
+    );
   });
 
   it("does not retry termination-unknown and releases the message slot exactly once", async () => {
