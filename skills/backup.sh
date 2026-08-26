@@ -13,7 +13,7 @@
 # Config (edit these if your setup differs):
 GITHUB_APP_ID="3083609"
 GITHUB_INSTALLATION_ID="116126634"
-GITHUB_REPO_OWNER="tuggspeedman-ai"
+GITHUB_REPO_OWNER="jonathanavni"
 GITHUB_REPO_NAME="kuchiclaw-memory"
 
 set -euo pipefail
