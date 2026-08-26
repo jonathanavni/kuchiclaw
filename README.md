@@ -33,14 +33,16 @@ Each user message triggers a fresh Docker container. The container gets the [Cla
 
 **Containers are the security boundary.** The agent can only see what's explicitly mounted. Secrets are passed via stdin — never written to disk. IPC requests are validated and authorized before execution.
 
-**Memory persists across sessions** through four living files:
+**Memory persists across sessions** through six living files:
 
 | File | Scope | Access | Purpose |
 |------|-------|--------|---------|
 | SOUL.md | Global | Read-only | Personality, behavior rules |
 | TOOLS.md | Global | Read-only | Available tools and usage docs |
-| MEMORY.md | Per-group | Read-write | Long-lived curated facts |
-| CONTEXT.md | Per-group | Read-write | Session working memory |
+| HEARTBEAT.md | Global | Read-only | Self-maintenance checklist for scheduled runs |
+| MEMORY.md | Per-group | Read-write | Long-lived curated facts (prompt-injected) |
+| CONTEXT.md | Per-group | Read-write | Session working memory (prompt-injected) |
+| TODO.md | Per-group | Read-write | Shared to-do list — read on demand, never prompt-injected |
 
 For the full architecture deep-dive — design decisions, tradeoffs, and implementation phases — see [ARCHITECTURE.md](ARCHITECTURE.md).
 

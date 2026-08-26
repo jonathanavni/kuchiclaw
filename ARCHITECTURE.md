@@ -41,9 +41,9 @@ Telegram ──→ Orchestrator ──→ Per-Group Queue ──→ Container Ru
 
 ## Design Decisions
 
-### Living Files: Four-File Memory System
+### Living Files: Six-File Memory System
 
-OpenClaw uses 6+ markdown files. NanoClaw simplifies to a single `CLAUDE.md` per group. KuchiClaw uses four files with clean separation across two dimensions:
+OpenClaw uses 6+ markdown files. NanoClaw simplifies to a single `CLAUDE.md` per group. KuchiClaw uses six files with clean separation across two dimensions (four core files below, plus the global read-only `HEARTBEAT.md` self-maintenance checklist and the per-group read-write `TODO.md` shared list — mounted but deliberately not prompt-injected, read on demand):
 
 | | Global (shared) | Per-group (isolated) |
 |---|---|---|
@@ -356,7 +356,8 @@ kuchiclaw/
 │   └── package-lock.json           # Lockfile — agent runtime can't float
 ├── skills/                         # Simple skills — CLI scripts/API wrappers (ro mount)
 │   ├── fastmail.mjs                # Email via JMAP (send, inbox, read, reply)
-│   ├── calendar.mjs                # Calendar skill
+│   ├── gcal.mjs                    # Family Google Calendar (service-account JWT)
+│   ├── calendar.mjs                # .ics email invites (external guests)
 │   ├── echo.sh                     # Minimal example skill
 │   └── backup.sh                   # Living file + SQLite backup to private git repo
 ├── groups/                         # Per-group living files (gitignored, created at runtime)
