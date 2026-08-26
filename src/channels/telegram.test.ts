@@ -261,6 +261,21 @@ describe("sendChunked (round-1 F2: per-chunk delivery)", () => {
     expect(sleeps).toEqual([2000, 2000]);
   });
 
+  it("honors a large retry_after verbatim — never retries before Telegram permits (post-impl r2)", async () => {
+    const sleeps: number[] = [];
+    let failures = 1;
+    const floodOnce = vi.fn(async () => {
+      if (failures-- > 0) {
+        throw { response: { body: { error_code: 429, description: "flood", parameters: { retry_after: 300 } } } };
+      }
+    });
+
+    await sendChunked("short message", floodOnce, floodOnce, {
+      maxLen: 200, sleep: async (ms) => { sleeps.push(ms); },
+    });
+    expect(sleeps).toEqual([300_000]);
+  });
+
   it("a permanent 403 on chunk 2 throws PermanentDeliveryError with no retry and chunk 1 sent once (round-3 F2)", async () => {
     const c = collector();
     const sleeps: number[] = [];

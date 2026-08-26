@@ -400,9 +400,11 @@ async function sendWithRetry(send: () => Promise<void>, options: ChunkSendOption
         );
       }
       if (attempt >= retries) throw err;
-      // Clamp retry_after: a flood-limit response can carry hundreds of seconds,
-      // which would pin this group's queue slot for the whole wait.
-      await sleep(Math.min(retryAfterMs ?? baseMs * Math.pow(2, attempt - 1), 60_000));
+      // Honor retry_after verbatim — retrying earlier both extends the flood
+      // limit and, on exhaustion, escalates to deliver()'s whole-message retry
+      // (chunk-0 replay). Holding this group's queue slot for the wait is the
+      // correct backpressure; delivery is already a separate failure domain.
+      await sleep(retryAfterMs ?? baseMs * Math.pow(2, attempt - 1));
     }
   }
 }

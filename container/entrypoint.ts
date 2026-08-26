@@ -26,14 +26,10 @@ import {
   type OAuthTokens,
 } from "./prepare.js";
 
-export interface ContainerOutput {
-  status: "success" | "error";
-  result?: string;
-  error?: string;
-  errorKind?: "auth" | "rate_limit" | "max_turns" | "container_crash" | "other";
-  newTokens?: OAuthTokens;
-  warnings?: string[];
-}
+// Declared in prepare.ts (SDK-free) so the host's compile-time parity pin can
+// import it without pulling this file's SDK dynamic import into src's program.
+export type { ContainerOutput } from "./prepare.js";
+import type { ContainerOutput } from "./prepare.js";
 
 /** Sink for the signed envelope — a seam so tests spy instead of touching the
  *  filesystem. Production writes it atomically to the mounted output dir. */

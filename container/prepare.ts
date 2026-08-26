@@ -53,6 +53,18 @@ export interface OAuthTokens {
   expiresAt: number;
 }
 
+/** Container-side copy of the wire shape — keep identical to src/types.ts
+ *  ContainerOutput (the container can't import from src/). Pinned at compile
+ *  time by src/wire-parity.test.ts, which pretest's tsc actually checks. */
+export interface ContainerOutput {
+  status: "success" | "error";
+  result?: string;
+  error?: string;
+  errorKind?: "auth" | "rate_limit" | "max_turns" | "container_crash" | "other";
+  newTokens?: OAuthTokens;
+  warnings?: string[];
+}
+
 export type ContainerErrorKind =
   | "auth"
   | "rate_limit"
