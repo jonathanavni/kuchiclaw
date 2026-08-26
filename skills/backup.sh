@@ -112,9 +112,20 @@ if [ -d "$GROUPS_DIR" ]; then
   done
 fi
 
-# SQLite backup (safe with WAL mode)
+# SQLite backup as a text dump, not a binary snapshot: binary .backup files
+# don't delta-compress, so git history grew by the full DB size every day.
+# .dump runs in a read transaction (safe with WAL) and is deterministic, so
+# unchanged days produce no diff at all. Restore: sqlite3 new.db < backup.sql
 if [ -f "$DB_FILE" ]; then
-  sqlite3 "$DB_FILE" ".backup $MEMORY_REPO/kuchiclaw-backup.db"
+  # .dump omits PRAGMA user_version, but that's the IPC-layout attestation the
+  # startup gate requires (=2) — append it so a restored DB passes the gate.
+  {
+    sqlite3 "$DB_FILE" ".dump"
+    printf 'PRAGMA user_version = %s;\n' "$(sqlite3 "$DB_FILE" 'PRAGMA user_version;')"
+  } > "$MEMORY_REPO/kuchiclaw-backup.sql"
+  # Drop the legacy binary snapshot so commits stop carrying it (history keeps
+  # old blobs, but growth stops here).
+  rm -f "$MEMORY_REPO/kuchiclaw-backup.db"
 fi
 
 # Stage, check for changes, commit and push
