@@ -5,6 +5,7 @@ export const AGENT_VISIBLE_SECRET_KEYS = [
   "CLAUDE_CODE_OAUTH_TOKEN",
   "ANTHROPIC_API_KEY",
   "FASTMAIL_API_TOKEN",
+  "GCAL_SERVICE_ACCOUNT_KEY",
 ] as const;
 
 // Result-transport constants — kept byte-identical to src/config.ts (parity test).

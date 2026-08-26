@@ -122,9 +122,47 @@ node /workspace/skills/fastmail.mjs reply <messageId> "Reply body text"
 ```
 Threading headers (In-Reply-To, References) are set automatically.
 
-### calendar (calendar invites)
+### gcal (family Google Calendar — preferred for family events)
 
-Create, update, and cancel Google Calendar events by sending iCalendar (.ics) email invitations. Recipients' Gmail auto-detects the invite and adds it to their calendar.
+Directly create, edit, and delete events on the shared family calendar (and any other calendar shared with the agent's service account). Changes appear in everyone's Google Calendar automatically — no invitations involved. **Use this for family events; use the `calendar` skill below only to invite people outside the shared calendar.**
+
+**List accessible calendars (IDs + roles):**
+```bash
+node /workspace/skills/gcal.mjs calendars
+```
+Save the family calendar's ID to MEMORY.md the first time you see it. If a newly shared calendar doesn't appear, subscribe once: `node /workspace/skills/gcal.mjs subscribe <calendarId>`.
+
+**Upcoming events / search:**
+```bash
+node /workspace/skills/gcal.mjs agenda <calendarId> [days]      # default 7
+node /workspace/skills/gcal.mjs find <calendarId> "dentist" [days]   # default 60
+```
+Output lines start with `[eventId]` — you need the eventId to update or delete.
+
+**Create an event (preferred — file-based, shell-safe):** write the event as JSON to a file with your file tools, then:
+```bash
+node /workspace/skills/gcal.mjs create-json <calendarId> /tmp/event.json
+```
+where the file contains e.g. `{"summary":"Dinner with the Cohens","start":"2026-08-30T18:00:00","end":"2026-08-30T20:00:00","description":"...","location":"..."}`.
+
+**Never interpolate event titles/descriptions into a bash command line** — text like `Pay $100` or anything with quotes/backticks gets mangled or executed by the shell. The file-based form avoids this entirely. The inline form is acceptable only for plain alphanumeric text:
+```bash
+node /workspace/skills/gcal.mjs create <calendarId> "Dentist" "2026-08-30T18:00:00" "2026-08-30T19:00:00"
+```
+Datetimes without an offset are interpreted in America/Chicago (the household zone). Bare dates (`2026-08-30`) create all-day events — the end date is exclusive, so a one-day event on the 30th ends `2026-08-31`.
+
+**Update / delete:**
+```bash
+node /workspace/skills/gcal.mjs update-json <calendarId> <eventId> /tmp/patch.json
+node /workspace/skills/gcal.mjs delete <calendarId> <eventId>
+```
+The patch JSON may contain any of: `summary`, `start`, `end`, `description`, `location`.
+
+**Recurring events:** listings expand a series into instances; recurring instances are labeled `(recurring — series id: ...)`. Updating/deleting with the **instance id** changes only that occurrence; use the **series id** as the eventId to change or delete the whole series. Confirm with the user which scope they mean before mutating a recurring event.
+
+### calendar (email invites — for people OUTSIDE the shared family calendar)
+
+Create, update, and cancel Google Calendar events by sending iCalendar (.ics) email invitations. Recipients' Gmail auto-detects the invite and adds it to their calendar. Prefer `gcal` for family events; use this when someone must be *invited* (e.g., guests without access to the family calendar).
 
 **Create an event:**
 ```bash
@@ -133,7 +171,7 @@ node /workspace/skills/calendar.mjs create '{"title":"Dentist","start":"2026-04-
 
 Fields:
 - `title` (required) — event name
-- `start` (required) — ISO 8601 datetime with timezone offset (e.g., `+03:00` for Israel)
+- `start` (required) — ISO 8601 datetime with timezone offset (e.g., `-05:00` for Austin daylight time, `-06:00` standard; family in Israel is `+03:00`/`+02:00`)
 - `duration` (required, or use `end`) — human format (`1h`, `30m`, `1h30m`) or ISO 8601 (`PT1H30M`)
 - `end` — ISO 8601 datetime (alternative to `duration`)
 - `attendees` (required) — array of email addresses to invite

@@ -19,6 +19,7 @@ import {
   getSecrets,
   getSkillSecrets,
   resetSkillSecretWarningsForTest,
+  SKILL_SECRET_SPECS,
 } from "./auth.js";
 
 beforeEach(() => {
@@ -26,8 +27,14 @@ beforeEach(() => {
   authConfig.MAIN_CHAT_ID = "tg-999";
   vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
   vi.stubEnv("ANTHROPIC_API_KEY", "");
-  vi.stubEnv("FASTMAIL_API_TOKEN", "");
-  vi.stubEnv("FASTMAIL_GROUPS", "");
+  // Clear EVERY registered skill secret, not a hardcoded list — an ambient
+  // value for any spec (e.g. a developer shell that exported one for a live
+  // skill smoke) would otherwise add warnings/injections these tests don't
+  // expect. Keeps the suite hermetic as the registry grows.
+  for (const spec of SKILL_SECRET_SPECS) {
+    vi.stubEnv(spec.env, "");
+    vi.stubEnv(spec.groupsEnv, "");
+  }
   vi.mocked(getOAuthToken).mockResolvedValue(null);
 });
 

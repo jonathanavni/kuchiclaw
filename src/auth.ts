@@ -7,6 +7,9 @@ import { isValidGroupName } from "./ipc-auth.js";
 
 export const SKILL_SECRET_SPECS = [
   { env: "FASTMAIL_API_TOKEN", groupsEnv: "FASTMAIL_GROUPS" },
+  // Base64 of the GCP service-account JSON key (skills/gcal.mjs); base64
+  // because systemd EnvironmentFile can't hold the raw multiline PEM.
+  { env: "GCAL_SERVICE_ACCOUNT_KEY", groupsEnv: "GCAL_GROUPS" },
 ] as const;
 
 const warnedEmptyEntitlements = new Set<string>();
