@@ -48,7 +48,7 @@ For the full architecture deep-dive — design decisions, tradeoffs, and impleme
 
 ## Clone it and make it yours
 
-KuchiClaw is designed to be forked and customized. The codebase is ~2,000 lines across 15 source files. Here's what you can change:
+KuchiClaw is designed to be forked and customized. The codebase is ~5,000 lines across 28 source files, with a 422-test suite alongside. Here's what you can change:
 
 - **Add skills** — drop a script in `skills/`, document it in TOOLS.md. The agent shells out to run it. Or add MCP servers via `mcp-servers.json`.
 - **Change the personality** — edit [SOUL.md](SOUL.md). This is the agent's system prompt identity.
@@ -82,6 +82,7 @@ MAIN_CHAT_ID=tg-your-chat-id       # Send /start to the bot — it echoes your c
 ALLOWED_SENDER_IDS=123456789        # /start also echoes your user ID; comma-separated ("*" = explicitly allow anyone)
 
 # Optional
+CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...  # Dedicated grant from `claude setup-token` (recommended for servers)
 ANTHROPIC_API_KEY=sk-ant-...        # Fallback if OAuth isn't set up (auto-downgrades to Sonnet 5)
 FASTMAIL_API_TOKEN=...              # For the email skill
 FASTMAIL_GROUPS=main,tg-123         # Explicitly entitled groups (unset/empty = no access)
@@ -89,7 +90,9 @@ FASTMAIL_GROUPS=main,tg-123         # Explicitly entitled groups (unset/empty = 
 
 ### Authentication
 
-**Option A: Claude Max OAuth (recommended)** — uses your existing Claude Max subscription. Export tokens to `data/oauth.json`:
+**Option A: dedicated OAuth grant (recommended for servers)** — run `claude setup-token` while logged into your Claude Max account and put the resulting token in `.env` as `CLAUDE_CODE_OAUTH_TOKEN`. The grant has its own refresh lineage, so the bot never fights your interactive Claude Code login over single-use refresh tokens — the failure mode that crash-loops shared-credential setups.
+
+**Option B: Claude Max OAuth auto-refresh** — export your existing session's tokens to `data/oauth.json`:
 
 ```json
 {
@@ -99,11 +102,11 @@ FASTMAIL_GROUPS=main,tg-123         # Explicitly entitled groups (unset/empty = 
 }
 ```
 
-`expiresAt` is milliseconds since the epoch (as stored by the macOS keychain).
+`expiresAt` is milliseconds since the epoch (as stored by the macOS keychain). On macOS, `deploy/export-oauth.sh` extracts tokens from the keychain automatically. Tokens are refreshed at the start of each container run and persisted back to `oauth.json` — no manual rotation needed. Fine for local dev; on a server prefer Option A.
 
-On macOS, `deploy/export-oauth.sh` extracts tokens from the keychain automatically. Tokens are refreshed at the start of each container run and persisted back to `oauth.json` — no manual rotation needed.
+**Option C: API key** — set `ANTHROPIC_API_KEY` in `.env`. Pay-per-use billing. Automatically uses Sonnet 5 instead of Opus to reduce costs.
 
-**Option B: API key** — set `ANTHROPIC_API_KEY` in `.env`. Pay-per-use billing. Automatically uses Sonnet 5 instead of Opus to reduce costs.
+Resolution order (see `src/auth.ts`): explicit `CLAUDE_CODE_OAUTH_TOKEN` → `data/oauth.json` → `ANTHROPIC_API_KEY` → macOS keychain (local dev).
 
 ### Run
 
@@ -137,6 +140,8 @@ curl -s "https://wttr.in/$1?format=3"
 
 Then add usage docs to TOOLS.md so the agent knows how to call it. That's it — no registration, no protocol, no framework code.
 
+The repo ships working examples: `fastmail.mjs` (send/read email via JMAP), `gcal.mjs` (a shared Google Calendar via a GCP service account), `calendar.mjs` (.ics email invites for external guests), and `backup.sh` (the daily memory backup). Skill secrets are per-group entitled — a token only reaches the groups you explicitly name (e.g. `FASTMAIL_GROUPS`).
+
 ### MCP skills
 
 For tools that benefit from structured schemas, add an entry to `mcp-servers.json`. The Claude Agent SDK auto-discovers tools from MCP servers.
@@ -150,7 +155,7 @@ kuchiclaw/                (this repo — public, code + config)
   SOUL.md                 Agent personality (edit this to change who the agent is)
   TOOLS.md                Tool documentation (edit this when adding skills)
   HEARTBEAT.md            Self-maintenance checklist
-  src/                    ~4,000 lines across ~26 files
+  src/                    Host orchestrator — queue, IPC, scheduler, channels
   container/              Runs inside Docker (Claude Agent SDK)
   skills/                 CLI scripts mounted into containers
   groups/example/         Example living files for reference
@@ -198,6 +203,9 @@ A few decisions that might be interesting if you're building something similar:
 - **Per-group isolation.** Each Telegram chat gets its own memory, context, and IPC authorization scope. The main chat has admin access; others are sandboxed.
 - **Crash recovery.** Messages track processing status in SQLite. On restart, orphaned messages are detected and re-enqueued automatically.
 - **OAuth auto-refresh.** The bot uses a Claude Max subscription without manual token management. Tokens refresh at the start of each container run and are persisted back to the host.
+- **Signed container output.** The agent process shares a uid with the container entrypoint, so a bare stdout channel is forgeable. Results ride an HMAC-signed file on a per-run mount instead — a compromised agent can't fabricate orchestrator-trusted output.
+- **Fail-closed startup.** The sender allowlist, the startup attestation gate, and the stray-container reap all refuse to run rather than run wrong. A file-based circuit breaker paces crash-loops and sends a Telegram alert on sustained failure instead of dying silently.
+- **At-most-once scheduling.** Missed cron occurrences collapse into a single catch-up run after downtime, and a container that may have already performed side effects is never retried.
 
 ## Prior art
 

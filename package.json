@@ -1,6 +1,6 @@
 {
   "name": "kuchiclaw",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Minimal AI agent framework with Docker container isolation",
   "type": "module",
   "scripts": {
