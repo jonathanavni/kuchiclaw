@@ -34,6 +34,7 @@ import { acquireInstanceLock } from "./instance-lock.js";
 import { loadMcpServers } from "./mcp-config.js";
 import { registerSender } from "./ipc.js";
 import { quarantineLooseRootRequests, startPolling, stopPolling } from "./ipc-poll.js";
+import { runStartupRetention, startRetentionSweep, stopRetentionSweep } from "./retention.js";
 import { startScheduler, stopScheduler } from "./task-scheduler.js";
 import { chatIdToGroup, groupToChatId } from "./group-mapping.js";
 import {
@@ -291,6 +292,7 @@ export async function main(startupOptions: StartupGateOptions = {}): Promise<voi
       stopPolling();
       stopScheduler();
       stopStuckSweep();
+      stopRetentionSweep();
 
       void (async () => {
         try {
@@ -325,11 +327,15 @@ export async function main(startupOptions: StartupGateOptions = {}): Promise<voi
     });
 
     recoverOrphanedMessages({ secrets, channel, mcpServers });
+    // Pre-intake: the queue holds only recovery re-enqueues here, none of which
+    // are >1h-old pending rows, so the stranded-pending pass is race-free.
+    runStartupRetention();
 
     await channel.connect();
     startPolling();
     startScheduler({ secrets, channel, mcpServers });
     startStuckSweep({ secrets, channel, mcpServers });
+    startRetentionSweep();
     console.log("[Orchestrator] KuchiClaw is running. Press Ctrl+C to stop.");
 
     process.on("SIGINT", () => requestShutdown("signal"));
