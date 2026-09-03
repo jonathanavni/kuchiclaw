@@ -76,7 +76,7 @@ Working flow (Telegram): `npx tsx src/index.ts` (secrets loaded from `.env`) →
 - `deploy/kuchiclaw-alert@.service` — Templated oneshot unit invoked by `OnFailure`. Runs `deploy/alert.sh` with the failed unit name as `%i`
 - `deploy/alert.sh` — Telegram alert when systemd gives up restarting kuchiclaw. Curls Telegram's `sendMessage` API directly using `TELEGRAM_BOT_TOKEN` + `MAIN_CHAT_ID` from `.env`, includes last 20 journal lines. Has zero dependency on the kuchiclaw process — that's the whole point
 - `deploy/setup.sh` — VPS provisioning script: installs Docker + Node.js 24 + sqlite3 CLI, creates `kuchiclaw` user, clones repo, builds Docker image, installs all systemd units (service, alert, backup timer — enabled immediately)
-- `deploy/update.sh` — the one deploy path: `git pull` + `npm install`/rebuild + image rebuild + unit reinstall + restart as a single step, so host code and agent image can't skew
+- `deploy/update.sh` — the one deploy path: `git pull` + `npm install`/rebuild + image rebuild + unit reinstall + restart as a single step, so host code and agent image can't skew. The VPS authenticates to GitHub with a **read-only SSH deploy key** (`/opt/kuchiclaw/.ssh/id_ed25519`, remote `git@github.com:...`) because GitHub rate-limits anonymous git from datacenter IPs — see `.claude/memory/gotchas.md`. The pull retries 5× as a backstop. A failed update leaves the service STOPPED deliberately
 - `deploy/export-oauth.sh` — Exports OAuth tokens from macOS keychain to `data/oauth.json` for transfer to VPS
 - `deploy/kuchiclaw-backup.service` — systemd unit for daily living file + SQLite backup
 - `deploy/kuchiclaw-backup.timer` — systemd timer triggering backup daily at 03:00 UTC
