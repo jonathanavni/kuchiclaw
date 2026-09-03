@@ -47,7 +47,18 @@ if docker image inspect kuchiclaw-agent >/dev/null 2>&1 && \
 fi
 
 echo "[4/7] Pulling latest main..."
-sudo -u kuchiclaw git pull --ff-only
+# GitHub rate-limits ANONYMOUS git from datacenter IP ranges, so an unauthenticated
+# fetch from this VPS returns 401 on the upload-pack POST perhaps half the time —
+# every past deploy here was winning a coin flip. Retry rather than leaving the
+# service stopped over a transient throttle. The durable fix is a read-only deploy
+# key (see BACKLOG); this keeps deploys survivable until then.
+pull_ok=0
+for attempt in 1 2 3 4 5; do
+  if sudo -u kuchiclaw git pull --ff-only; then pull_ok=1; break; fi
+  echo "  pull attempt ${attempt} failed; retrying in $((attempt * 5))s..." >&2
+  sleep $((attempt * 5))
+done
+[ "$pull_ok" = "1" ] || { echo "ERROR: git pull failed 5 times — authenticate the host (deploy key) or check connectivity." >&2; exit 1; }
 
 echo "[5/7] Installing host dependencies (clean, ABI-correct for this Node)..."
 sudo -u kuchiclaw npm ci
