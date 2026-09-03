@@ -355,7 +355,11 @@ kuchiclaw/
 │   ├── package.json                # Container-specific deps (claude-agent-sdk + tsx)
 │   └── package-lock.json           # Lockfile — agent runtime can't float
 ├── skills/                         # Simple skills — CLI scripts/API wrappers (ro mount)
-│   ├── fastmail.mjs                # Email via JMAP (send, inbox, read, reply)
+│   ├── fastmail.mjs                # Email via JMAP (send, folders, list, inbox, read, mark-read, reply)
+│   ├── lib/                        # Shared skill helpers (+ colocated .mjs tests)
+│   │   ├── email-text.mjs          # HTML->text, URL stripping, untrusted-content fencing
+│   │   ├── jmap.mjs                # JMAP client + method-error unwrapping + id validation
+│   │   └── args.mjs                # CLI flag/date parsing (throws rather than defaulting)
 │   ├── gcal.mjs                    # Family Google Calendar (service-account JWT)
 │   ├── calendar.mjs                # .ics email invites (external guests)
 │   ├── echo.sh                     # Minimal example skill

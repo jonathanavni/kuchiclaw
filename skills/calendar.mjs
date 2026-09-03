@@ -16,6 +16,10 @@
 import crypto from "node:crypto";
 
 const API = "https://api.fastmail.com/jmap/api/";
+// Deployment-specific: this instance's Fastmail account and "send as" identity.
+// They are opaque ids, not credentials -- useless without FASTMAIL_API_TOKEN --
+// but they are wired to one account, so a fork of this repo needs its own.
+// Get yours from the JMAP session endpoint (accountId) and Identity/get.
 const ACCOUNT_ID = "u53d64052";
 const IDENTITY_ID = "176981127"; // koochi@fastmail.com
 const ORGANIZER_EMAIL = "koochi@fastmail.com";

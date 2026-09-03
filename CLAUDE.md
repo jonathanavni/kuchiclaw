@@ -63,7 +63,8 @@ Working flow (Telegram): `npx tsx src/index.ts` (secrets loaded from `.env`) →
 - `TOOLS.md` — Available tools documentation including IPC, skills, and scheduled tasks (global, read-only)
 - `HEARTBEAT.md` — Self-maintenance checklist for heartbeat tasks (global, read-only)
 - `mcp-servers.json` — MCP server configurations (empty by default, add servers as needed)
-- `skills/` — Simple skills directory (CLI scripts/API wrappers, mounted read-only into containers). Includes `fastmail.mjs` (email via JMAP as koochi@fastmail.com), `gcal.mjs` (family Google Calendar via GCP service account, JWT key auth), `calendar.mjs` (.ics email invites for external guests), `echo.sh` (minimal example), `backup.sh` (living file + SQLite backup to private git repo)
+- `skills/lib/` — Shared skill helpers, the one place skill logic is unit-tested: `email-text.mjs` (HTML→text, URL stripping, untrusted-content fencing), `jmap.mjs` (JMAP client; `unwrap()` turns JMAP's 200-with-`["error"]` method failures into real throws, so an API outage can't read as "no mail"), `args.mjs` (flag/date parsing that errors rather than silently defaulting)
+- `skills/` — Simple skills directory (CLI scripts/API wrappers, mounted read-only into containers). Includes `fastmail.mjs` (email via JMAP as koochi@fastmail.com — send/folders/list/inbox/read/mark-read/reply; all message-derived output is sanitized and wrapped in nonce-carrying UNTRUSTED delimiters, since mail is attacker-controlled input to an agent with real capabilities), `gcal.mjs` (family Google Calendar via GCP service account, JWT key auth), `calendar.mjs` (.ics email invites for external guests), `echo.sh` (minimal example), `backup.sh` (living file + SQLite backup to private git repo)
 - `groups/example/` — Example living files for reference (tracked in git). Real groups are gitignored — created at runtime by `ensureGroupFolder()`
 - `data/kuchiclaw.db` — SQLite database (auto-created on first run)
 - `data/ipc/<group>/` — per-group IPC request directories (each container writes only to its own; host polls all). `data/ipc-errors/` (outside the mounted tree) quarantines failed/malformed requests. `data/ipc-layout-v2` — cutover attestation marker (see `deploy/cutover-m12-p1.sh`)
@@ -90,7 +91,7 @@ Working flow (Telegram): `npx tsx src/index.ts` (secrets loaded from `.env`) →
 - Minimal dependencies — host: better-sqlite3, node-telegram-bot-api, dotenv, cron-parser. Container: claude-agent-sdk (web tools are SDK built-in)
 - Comments explain WHY, not WHAT
 - No dashboards or web UIs — Telegram is the interface
-- Tests via vitest (`npm test`). Test files colocated as `*.test.ts`. Use in-memory SQLite via `resetDb(new Database(":memory:"))` for DB tests.
+- Tests via vitest (`npm test`). Test files colocated as `*.test.ts` (and `*.test.mjs` for `skills/lib/`, which vitest's default include picks up). Note `skills/` is outside the tsconfig `include`, so it is NOT typechecked by the `tsc --noEmit` pretest — keep skill logic in `skills/lib/` where it can at least be unit-tested. Use in-memory SQLite via `resetDb(new Database(":memory:"))` for DB tests.
 
 ## Workflow & Task Tracking
 
